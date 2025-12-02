@@ -36,22 +36,3 @@ jobs:
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python daily_job.py
-```
-
-4.  Click **Commit changes**.
-
-### Step 3: Verify `daily_job.py` is ready
-Ensure your `daily_job.py` file (which is in your repo) has this logic at the top to read the secrets injected by the workflow above:
-
-```python
-import os
-
-# ... inside your code ...
-
-# GitHub Actions injects secrets as Environment Variables
-if "DATABASE_URL" in os.environ:
-    db_url = os.environ["DATABASE_URL"]
-    # Fix protocol for SQLAlchemy
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-    engine = create_engine(db_url)
