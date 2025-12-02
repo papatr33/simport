@@ -1,0 +1,57 @@
+name: Daily Portfolio Update
+
+on:
+  # Schedule: Runs at 13:30 UTC (which is 9:30 AM EST / 21:30 SG/HK Time)
+  # GitHub Actions uses UTC time. You must convert your local market open time to UTC.
+  schedule:
+    - cron: '30 13 * * 1-5' # Mon-Fri
+  
+  # Manual Trigger: Allows you to click a button to run it anytime (Essential for testing)
+  workflow_dispatch:
+
+jobs:
+  run-analytics-script:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Check out the repository code
+      - uses: actions/checkout@v3
+
+      # 2. Set up Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # 3. Install dependencies from requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      # 4. Run the Python script
+      - name: Run Daily Job
+        env:
+          # This maps the GitHub Secrets to Python's os.environ
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python daily_job.py
+```
+
+4.  Click **Commit changes**.
+
+### Step 3: Verify `daily_job.py` is ready
+Ensure your `daily_job.py` file (which is in your repo) has this logic at the top to read the secrets injected by the workflow above:
+
+```python
+import os
+
+# ... inside your code ...
+
+# GitHub Actions injects secrets as Environment Variables
+if "DATABASE_URL" in os.environ:
+    db_url = os.environ["DATABASE_URL"]
+    # Fix protocol for SQLAlchemy
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(db_url)
