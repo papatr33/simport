@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from datetime import datetime, timedelta, date
 import time
+import numpy as np
 
 # ==========================================
 # 1. DATABASE CONFIGURATION
@@ -31,18 +32,16 @@ class Trade(Base):
     ticker = Column(String, nullable=False)
     direction = Column(String, nullable=False)
     
-    # Execution Details
     entry_date = Column(DateTime, default=datetime.now)
-    entry_price = Column(Float, nullable=True) # Price per share
-    quantity = Column(Float, nullable=True)    # Number of shares
-    trade_amount = Column(Float, nullable=True) # Total $ allocated
+    entry_price = Column(Float, nullable=True)
+    quantity = Column(Float, nullable=True)
+    trade_amount = Column(Float, nullable=True)
     
-    # Exit Details
     exit_date = Column(DateTime, nullable=True)
     exit_price = Column(Float, nullable=True)
     realized_pnl = Column(Float, default=0.0)
     
-    status = Column(String, default='PENDING') # PENDING, OPEN, CLOSED
+    status = Column(String, default='PENDING')
     notes = Column(String, nullable=True)
     
     user = relationship("User", back_populates="trades")
@@ -52,17 +51,12 @@ class SystemConfig(Base):
     key = Column(String, primary_key=True)
     value = Column(String) 
 
-# --- DB Connection ---
 def get_db_engine():
-    # 1. Streamlit Cloud Secrets
     if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
         db_url = st.secrets["DATABASE_URL"]
-    # 2. Env Vars (GitHub Actions)
     elif "DATABASE_URL" in os.environ:
         db_url = os.environ["DATABASE_URL"]
-    # 3. Local Secrets File (Manual)
     else:
-        # Fallback to SQLite
         db_url = 'sqlite:///portfolio.db'
 
     if db_url.startswith("postgres://"):
@@ -74,20 +68,61 @@ def get_db_engine():
         return create_engine(db_url)
 
 engine = get_db_engine()
-# Attempt to create tables (will skip if they exist)
 try:
     Base.metadata.create_all(engine)
 except:
-    pass # Handle connection errors gracefully in UI
+    pass
 Session = sessionmaker(bind=engine)
 session = Session()
 
 # ==========================================
-# 2. ANALYTICS ENGINE
+# 2. DATA FETCHING HELPERS (ROBUST)
+# ==========================================
+def extract_scalar(val):
+    """Helper to ensure we get a single float from yfinance result"""
+    if isinstance(val, (pd.Series, pd.DataFrame, np.ndarray, list)):
+        # Flatten and take first item
+        try:
+            val = val.values.flatten()[0]
+        except:
+            if hasattr(val, 'iloc'):
+                val = val.iloc[0]
+            elif len(val) > 0:
+                val = val[0]
+    return float(val)
+
+def get_live_price(ticker):
+    try:
+        # Request only 1 day of history
+        data = yf.Ticker(ticker).history(period="1d")
+        if not data.empty:
+            # Safe extraction
+            return extract_scalar(data['Close'].iloc[-1])
+        return 0.0
+    except:
+        return 0.0
+
+def get_historical_price(ticker, date_obj):
+    try:
+        start = date_obj
+        end = date_obj + timedelta(days=5) # 5 day buffer for weekends
+        df = yf.download(ticker, start=start, end=end, progress=False)
+        
+        if not df.empty:
+            if 'Close' in df.columns:
+                val = df['Close'].iloc[0]
+            else:
+                val = df.iloc[0,0] # Fallback
+            return extract_scalar(val)
+        return 0.0
+    except:
+        return 0.0
+
+# ==========================================
+# 3. ANALYTICS ENGINE
 # ==========================================
 
 def calculate_portfolio_metrics(user_id):
-    """Calculates live cash, equity, and positions."""
     user = session.query(User).filter_by(id=user_id).first()
     trades = session.query(Trade).filter_by(user_id=user_id).all()
     
@@ -96,28 +131,32 @@ def calculate_portfolio_metrics(user_id):
     active_holdings = []
     
     for t in trades:
-        # PENDING: Cash blocked
+        # Safe checks for none values
+        t_amt = t.trade_amount or 0.0
+        t_qty = t.quantity or 0.0
+        t_entry = t.entry_price or 0.0
+
         if t.status == 'PENDING':
-            cash -= t.trade_amount
+            cash -= t_amt
             
-        # OPEN: Mark to Market
         elif t.status == 'OPEN':
-            cash -= t.trade_amount # Deduct initial cost
+            cash -= t_amt
             
             curr_price = get_live_price(t.ticker)
             
             if t.direction == 'Long':
-                position_value = t.quantity * curr_price
+                position_value = t_qty * curr_price
             else:
-                # Short Value = Initial Capital + (Entry - Current)*Qty
-                short_pnl = (t.entry_price * t.quantity) - (curr_price * t.quantity)
-                position_value = t.trade_amount + short_pnl
+                short_pnl = (t_entry * t_qty) - (curr_price * t_qty)
+                position_value = t_amt + short_pnl
             
             portfolio_value += position_value
             
-            # PnL Calc
-            if t.entry_price > 0:
-                pnl_pct = ((curr_price - t.entry_price)/t.entry_price) if t.direction == 'Long' else ((t.entry_price - curr_price)/t.entry_price)
+            if t_entry > 0:
+                if t.direction == 'Long':
+                    pnl_pct = (curr_price - t_entry) / t_entry
+                else:
+                    pnl_pct = (t_entry - curr_price) / t_entry
             else:
                 pnl_pct = 0.0
 
@@ -125,17 +164,16 @@ def calculate_portfolio_metrics(user_id):
                 "Ticker": t.ticker,
                 "Side": t.direction,
                 "Date": t.entry_date.strftime("%Y-%m-%d"),
-                "Qty": t.quantity,
-                "Entry": t.entry_price,
+                "Qty": t_qty,
+                "Entry": t_entry,
                 "Current": curr_price,
                 "Value": position_value,
                 "PnL %": pnl_pct * 100,
                 "Notes": t.notes
             })
             
-        # CLOSED: Cash returned
         elif t.status == 'CLOSED':
-            cash += t.realized_pnl + t.trade_amount 
+            cash += (t.realized_pnl or 0.0) + t_amt
 
     total_equity = cash + portfolio_value
     return {
@@ -146,42 +184,31 @@ def calculate_portfolio_metrics(user_id):
     }
 
 def generate_pnl_curve(user_id):
-    """
-    Reconstructs history. 
-    Crucial for Test Mode: When a backdated trade is added, this function 
-    finds the earliest date and downloads ALL data from then until now.
-    """
     user = session.query(User).filter_by(id=user_id).first()
     trades = session.query(Trade).filter_by(user_id=user_id).all()
     
     if not trades:
         return pd.DataFrame()
 
-    # 1. Find earliest date (handles backdated trades)
     start_date = min([t.entry_date for t in trades])
     end_date = datetime.now()
-    
-    # 2. Get Universe
     tickers = list(set([t.ticker for t in trades]))
     
-    # 3. Batch Download
     if tickers:
-        # 'Close' column only
-        raw_data = yf.download(tickers, start=start_date, end=end_date)
+        raw_data = yf.download(tickers, start=start_date, end=end_date, progress=False)
         
-        # Handle yfinance structure variations
+        # Robust data extraction for different yfinance versions
         if 'Close' in raw_data:
             data = raw_data['Close']
         else:
-            data = raw_data # Fallback
+            data = raw_data
             
-        # Handle Single Ticker (returns Series) vs Multiple (returns DataFrame)
+        # Ensure data is DataFrame even if single ticker (Series)
         if isinstance(data, pd.Series):
             data = data.to_frame(name=tickers[0])
     else:
         return pd.DataFrame()
 
-    # 4. Reconstruct Daily Value
     daterange = pd.date_range(start=start_date, end=end_date, freq='B')
     curve = []
     
@@ -190,40 +217,40 @@ def generate_pnl_curve(user_id):
         d_equity = 0.0
         
         for t in trades:
-            # Only count trade if it existed on date 'd'
             if t.entry_date <= d:
                 is_open = (t.status == 'OPEN') or (t.status == 'CLOSED' and t.exit_date > d)
                 is_closed_before = (t.status == 'CLOSED' and t.exit_date <= d)
 
                 if is_open:
-                    d_cash -= t.trade_amount
-                    # Value Position
+                    d_cash -= (t.trade_amount or 0.0)
                     try:
-                        # Find price on date 'd'
-                        # Use nearest backward fill if exact date missing (holidays)
+                        price = 0.0
+                        # Get price logic with duplicate column protection
                         if t.ticker in data.columns:
-                            # Access specific ticker column
-                            series = data[t.ticker]
-                            # Get price at date d (or last available)
-                            # We use asof to get nearest past data
+                            # Handle case where one ticker appears multiple times
+                            col_data = data[t.ticker]
+                            if isinstance(col_data, pd.DataFrame):
+                                col_data = col_data.iloc[:, 0] # Take first if duplicate
+                            
                             idx = data.index.get_indexer([d], method='pad')[0]
                             if idx != -1:
-                                price = series.iloc[idx]
+                                price = extract_scalar(col_data.iloc[idx])
                             else:
                                 price = t.entry_price
                         else:
                             price = t.entry_price
                         
+                        qty = t.quantity or 0.0
                         if t.direction == 'Long':
-                            d_equity += (t.quantity * price)
+                            d_equity += (qty * price)
                         else:
-                            short_pnl = (t.entry_price * t.quantity) - (price * t.quantity)
+                            short_pnl = (t.entry_price * qty) - (price * qty)
                             d_equity += (t.trade_amount + short_pnl)
                     except:
-                        d_equity += t.trade_amount 
+                        d_equity += (t.trade_amount or 0.0)
 
                 elif is_closed_before:
-                    d_cash += t.realized_pnl
+                    d_cash += (t.realized_pnl or 0.0)
         
         total_val = d_cash + d_equity
         curve.append({"Date": d, "Portfolio Value": total_val})
@@ -231,29 +258,8 @@ def generate_pnl_curve(user_id):
     return pd.DataFrame(curve)
 
 # ==========================================
-# 3. HELPERS
+# 4. GENERAL HELPERS
 # ==========================================
-def get_live_price(ticker):
-    try:
-        data = yf.Ticker(ticker).history(period="1d")
-        if not data.empty: return data['Close'].iloc[-1]
-        return 0.0
-    except: return 0.0
-
-def get_historical_price(ticker, date_obj):
-    """Finds close price for a specific historical date."""
-    try:
-        start = date_obj
-        end = date_obj + timedelta(days=5) # 5 day buffer for weekends/holidays
-        df = yf.download(ticker, start=start, end=end)
-        if not df.empty:
-            # Handle different yfinance return shapes
-            if 'Close' in df.columns:
-                return df['Close'].iloc[0]
-            return df.iloc[0,0] # Fallback
-        return 0.0
-    except: return 0.0
-
 def format_ticker(symbol, market):
     symbol = symbol.strip().upper()
     suffixes = {"US": "", "Hong Kong": ".HK", "China (Shanghai)": ".SS", "China (Shenzhen)": ".SZ", "Japan": ".T", "UK": ".L", "France": ".PA"}
@@ -284,277 +290,166 @@ def init_db():
     except: pass
 
 # ==========================================
-# 4. UI PAGES
+# 5. UI PAGES
 # ==========================================
-
 def admin_page():
     st.title("🛠️ Admin Dashboard")
-    
-    # 1. Config Section
     st.subheader("System Configuration")
     curr_mode = is_test_mode()
-    new_mode = st.toggle("Enable Test Mode (Backdating)", value=curr_mode, help="Allows analysts to input past dates for trades.")
+    new_mode = st.toggle("Enable Test Mode (Backdating)", value=curr_mode)
     if new_mode != curr_mode:
         cfg = session.query(SystemConfig).filter_by(key='test_mode').first()
         cfg.value = str(new_mode)
         session.commit()
-        st.success("Configuration updated.")
+        st.success("Updated!")
         time.sleep(1)
         st.rerun()
-
-    st.divider()
-
-    col1, col2 = st.columns([1, 2])
     
-    # 2. Create User
-    with col1:
-        st.subheader("Create New User")
+    st.divider()
+    c1, c2 = st.columns([1,2])
+    
+    with c1:
+        st.subheader("Create User")
         with st.form("create_user"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
             r = st.selectbox("Role", ["analyst", "pm"])
             cap = st.number_input("Initial Capital", value=5000000.0)
-            if st.form_submit_button("Create User"):
+            if st.form_submit_button("Create"):
                 if session.query(User).filter_by(username=u).first():
-                    st.error("User already exists")
+                    st.error("User exists")
                 else:
                     session.add(User(username=u, password_hash=hash_password(p), role=r, initial_capital=cap))
                     session.commit()
-                    st.success(f"User {u} created!")
+                    st.success("Created!")
                     st.rerun()
-
-    # 3. Manage Users (List & Delete)
-    with col2:
-        st.subheader("Manage Existing Users")
-        users = session.query(User).all()
-        
-        if users:
-            # Display Table
-            user_data = []
-            for usr in users:
-                user_data.append({
-                    "ID": usr.id,
-                    "Username": usr.username,
-                    "Role": usr.role,
-                    "Capital": f"${usr.initial_capital:,.0f}"
-                })
-            
-            st.dataframe(pd.DataFrame(user_data), use_container_width=True, hide_index=True)
-            
-            # Delete Interface
-            # Filter out current admin to prevent self-deletion if logged in as generic admin
-            # (Though 'admin' user is protected by logic below usually)
-            delete_candidates = [usr.username for usr in users if usr.username != 'admin']
-            
-            if delete_candidates:
-                st.write("---")
-                col_del_1, col_del_2 = st.columns([2,1])
-                with col_del_1:
-                    user_to_delete = st.selectbox("Select User to Delete", [""] + delete_candidates)
-                with col_del_2:
-                    st.write("") # Spacer
-                    st.write("")
-                    if st.button("🗑️ Delete User", type="primary"):
-                        if user_to_delete:
-                            u_obj = session.query(User).filter_by(username=user_to_delete).first()
-                            session.delete(u_obj)
-                            session.commit()
-                            st.warning(f"User {user_to_delete} has been permanently deleted.")
-                            time.sleep(1)
-                            st.rerun()
-            else:
-                st.info("No users available to delete.")
-        else:
-            st.info("No users found.")
-
-def analyst_page(user):
-    st.title(f"👨‍💻 {user.username} | Portfolio")
-    
-    # --- Metrics ---
-    metrics = calculate_portfolio_metrics(user.id)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Equity", f"${metrics['equity']:,.0f}")
-    c2.metric("Cash Balance", f"${metrics['cash']:,.0f}")
-    pnl_total = metrics['equity'] - user.initial_capital
-    c3.metric("Total PnL", f"${pnl_total:,.0f}", delta_color="normal" if pnl_total >=0 else "inverse")
-    
-    st.divider()
-
-    # --- PnL Curve ---
-    with st.expander("📈 Historical Performance Curve", expanded=True):
-        if len(metrics['trades']) > 0:
-            # Only generate curve if we have trades
-            df_curve = generate_pnl_curve(user.id)
-            if not df_curve.empty:
-                fig = px.line(df_curve, x='Date', y='Portfolio Value', title='Equity Curve')
-                fig.add_hline(y=user.initial_capital, line_dash="dot", annotation_text="Initial Capital")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("Could not retrieve historical data for chart.")
-        else:
-            st.info("No trades executed yet.")
-
-    # --- Trade Entry ---
-    st.subheader("📝 Enter Trade")
-    
-    test_mode = is_test_mode()
-    if test_mode:
-        st.info("🛠️ TEST MODE ON: You can backdate trades. Chart will update automatically.")
-
-    with st.form("trade_entry"):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            market = st.selectbox("Market", ["US", "Hong Kong", "China (Shanghai)", "China (Shenzhen)", "Japan", "UK", "France"])
-        with col2:
-            ticker_raw = st.text_input("Ticker").strip()
-        with col3:
-            direction = st.selectbox("Direction", ["Long", "Short"])
-        with col4:
-            allocation = st.number_input("Capital Allocation ($)", min_value=1000.0, step=10000.0)
-
-        # Date Input (Only visible/used in Test Mode)
-        trade_date = datetime.now()
-        if test_mode:
-            trade_date = st.date_input("Trade Date (Backdate)", value="today")
-
-        notes = st.text_area("Notes")
-        submit = st.form_submit_button("Submit Order")
-
-        if submit:
-            if not ticker_raw:
-                st.error("Ticker required.")
-            elif allocation > metrics['cash']:
-                st.error(f"Insufficient Cash. Available: ${metrics['cash']:,.0f}")
-            else:
-                final_ticker = format_ticker(ticker_raw, market)
-                
-                if test_mode:
-                    # BACKDATING LOGIC
-                    # 1. Find price at that specific date
-                    hist_date = datetime.combine(trade_date, datetime.min.time())
-                    fill_price = get_historical_price(final_ticker, hist_date)
                     
-                    if fill_price > 0:
-                        qty = allocation / fill_price
-                        new_trade = Trade(
-                            user_id=user.id, ticker=final_ticker, direction=direction,
-                            status='OPEN', entry_price=fill_price, quantity=qty,
-                            trade_amount=allocation, entry_date=hist_date, notes=f"[BACKDATED] {notes}"
-                        )
-                        session.add(new_trade)
-                        session.commit()
-                        st.success(f"Trade Backdated! Filled at ${fill_price:.2f} on {hist_date.date()}. Refreshing chart...")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error(f"No price data found for {final_ticker} on {trade_date}. Try a different date.")
-                else:
-                    # LIVE LOGIC
-                    new_trade = Trade(
-                        user_id=user.id, ticker=final_ticker, direction=direction,
-                        status='PENDING', trade_amount=allocation, notes=notes
-                    )
-                    session.add(new_trade)
+    with c2:
+        st.subheader("Manage Users")
+        users = session.query(User).all()
+        if users:
+            data = [{"ID":x.id, "User":x.username, "Role":x.role, "Capital":f"${x.initial_capital:,.0f}"} for x in users]
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+            
+            del_list = [u.username for u in users if u.username != 'admin']
+            if del_list:
+                to_del = st.selectbox("Delete User", [""] + del_list)
+                if st.button("Delete Selected") and to_del:
+                    session.delete(session.query(User).filter_by(username=to_del).first())
                     session.commit()
-                    st.success("Order Submitted. Will fill at next Open.")
+                    st.warning(f"Deleted {to_del}")
                     time.sleep(1)
                     st.rerun()
 
-    # --- Holdings & History ---
-    tab1, tab2 = st.tabs(["Active Holdings", "Trade History"])
+def analyst_page(user):
+    st.title(f"👨‍💻 {user.username} | Portfolio")
+    metrics = calculate_portfolio_metrics(user.id)
     
-    with tab1:
-        if metrics['holdings']:
-            df_h = pd.DataFrame(metrics['holdings'])
-            st.dataframe(df_h.style.format({
-                "Value": "${:,.0f}", "Entry": "${:,.2f}", "Current": "${:,.2f}", "PnL %": "{:.2f}%", "Qty": "{:,.0f}"
-            }), use_container_width=True)
-        else:
-            st.info("No active positions.")
-            
-    with tab2:
-        closed_trades = [t for t in metrics['trades'] if t.status == 'CLOSED']
-        if closed_trades:
-            hist_data = [{
-                "Ticker": t.ticker, "Side": t.direction, 
-                "Entry Date": t.entry_date.strftime("%Y-%m-%d"),
-                "Exit Date": t.exit_date.strftime("%Y-%m-%d") if t.exit_date else "-",
-                "Realized PnL": t.realized_pnl
-            } for t in closed_trades]
-            st.dataframe(pd.DataFrame(hist_data).style.format({"Realized PnL": "${:,.0f}"}), use_container_width=True)
-        else:
-            st.info("No closed trades.")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Equity", f"${metrics['equity']:,.0f}")
+    c2.metric("Cash", f"${metrics['cash']:,.0f}")
+    pnl = metrics['equity'] - user.initial_capital
+    c3.metric("PnL", f"${pnl:,.0f}")
+    
+    st.divider()
+    with st.expander("📈 Performance", expanded=True):
+        if metrics['trades']:
+            df_c = generate_pnl_curve(user.id)
+            if not df_c.empty:
+                fig = px.line(df_c, x='Date', y='Portfolio Value')
+                fig.add_hline(y=user.initial_capital, line_dash="dot")
+                st.plotly_chart(fig, use_container_width=True)
+        else: st.info("No trades to plot.")
+        
+    st.subheader("Enter Trade")
+    test_mode = is_test_mode()
+    if test_mode: st.info("TEST MODE: Backdating Enabled")
+    
+    with st.form("trade"):
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: mkt = st.selectbox("Market", ["US", "Hong Kong", "China (Shanghai)", "China (Shenzhen)", "Japan", "UK", "France"])
+        with c2: tik = st.text_input("Ticker")
+        with c3: direct = st.selectbox("Side", ["Long", "Short"])
+        with c4: alloc = st.number_input("Amount ($)", min_value=1000.0, step=10000.0)
+        
+        t_date = datetime.now()
+        if test_mode: t_date = st.date_input("Date", value="today")
+        note = st.text_area("Notes")
+        
+        if st.form_submit_button("Submit"):
+            if not tik: st.error("Ticker needed")
+            elif alloc > metrics['cash']: st.error("Insufficient Cash")
+            else:
+                final_tik = format_ticker(tik, mkt)
+                if test_mode:
+                    h_date = datetime.combine(t_date, datetime.min.time())
+                    price = get_historical_price(final_tik, h_date)
+                    if price > 0:
+                        qty = alloc / price
+                        t = Trade(user_id=user.id, ticker=final_tik, direction=direct, status='OPEN',
+                                  entry_price=price, quantity=qty, trade_amount=alloc, entry_date=h_date, notes=f"[BACKDATE] {note}")
+                        session.add(t)
+                        session.commit()
+                        st.success(f"Filled at ${price:.2f}")
+                        time.sleep(1)
+                        st.rerun()
+                    else: st.error("Price not found")
+                else:
+                    t = Trade(user_id=user.id, ticker=final_tik, direction=direct, status='PENDING', trade_amount=alloc, notes=note)
+                    session.add(t)
+                    session.commit()
+                    st.success("Pending Open")
+                    time.sleep(1)
+                    st.rerun()
+
+    st.subheader("Holdings")
+    if metrics['holdings']:
+        st.dataframe(pd.DataFrame(metrics['holdings']).style.format({"Value":"${:,.0f}","PnL %":"{:.2f}%"}), use_container_width=True)
+    else: st.info("Empty")
 
 def pm_page(user):
-    st.title("🏦 PM Dashboard")
+    st.title("PM Dashboard")
     analysts = session.query(User).filter_by(role='analyst').all()
     
-    # Aggregated View
     rows = []
     for a in analysts:
         m = calculate_portfolio_metrics(a.id)
-        rows.append({
-            "Analyst": a.username,
-            "Equity": m['equity'],
-            "Cash": m['cash'],
-            "Positions": len(m['holdings']),
-            "PnL": m['equity'] - a.initial_capital
-        })
+        rows.append({"Analyst": a.username, "Equity": m['equity'], "Cash": m['cash'], "PnL": m['equity'] - a.initial_capital})
     
-    st.subheader("Team Overview")
     if rows:
-        st.dataframe(pd.DataFrame(rows).style.format({"Equity": "${:,.0f}", "Cash": "${:,.0f}", "PnL": "${:,.0f}"}), use_container_width=True)
-    else:
-        st.info("No analysts found.")
+        st.dataframe(pd.DataFrame(rows).style.format({"Equity":"${:,.0f}","Cash":"${:,.0f}"}), use_container_width=True)
     
-    st.divider()
-    
-    # Individual Drilldown
-    if analysts:
-        selected_analyst = st.selectbox("Select Analyst for Detail", [a.username for a in analysts])
-        target_user = session.query(User).filter_by(username=selected_analyst).first()
+    sel = st.selectbox("Analyst Detail", [a.username for a in analysts]) if analysts else None
+    if sel:
+        target = session.query(User).filter_by(username=sel).first()
+        df_c = generate_pnl_curve(target.id)
+        if not df_c.empty:
+            fig = px.line(df_c, x='Date', y='Portfolio Value', title=f"{sel} Curve")
+            st.plotly_chart(fig, use_container_width=True)
         
-        if target_user:
-            metrics = calculate_portfolio_metrics(target_user.id)
-            
-            # Plot Chart
-            df_curve = generate_pnl_curve(target_user.id)
-            if not df_curve.empty:
-                fig = px.line(df_curve, x='Date', y='Portfolio Value', title=f"{target_user.username} Equity Curve")
-                fig.add_hline(y=target_user.initial_capital, line_dash="dot", annotation_text="Initial Capital")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Analyst has no history to plot.")
-                
-            st.subheader("Current Holdings")
-            if metrics['holdings']:
-                st.dataframe(pd.DataFrame(metrics['holdings']), use_container_width=True)
-            else:
-                st.info("No active holdings.")
+        m = calculate_portfolio_metrics(target.id)
+        if m['holdings']:
+            st.dataframe(pd.DataFrame(m['holdings']), use_container_width=True)
 
-# --- MAIN ---
 def main():
     st.set_page_config(layout="wide", page_title="AlphaTracker Pro")
     init_db()
-    
     if 'user_id' not in st.session_state: st.session_state.user_id = None
     
-    # LOGIN SCREEN
     if not st.session_state.user_id:
-        c1,c2,c3=st.columns([1,1,1])
+        c1,c2,c3 = st.columns([1,1,1])
         with c2:
-            st.title("AlphaTracker Pro")
+            st.title("AlphaTracker Login")
             with st.form("login"):
-                u = st.text_input("Username")
-                p = st.text_input("Password", type="password")
+                u = st.text_input("User")
+                p = st.text_input("Pass", type="password")
                 if st.form_submit_button("Login"):
                     user = session.query(User).filter_by(username=u).first()
                     if user and check_password(p, user.password_hash):
                         st.session_state.user_id = user.id
                         st.session_state.role = user.role
                         st.rerun()
-                    else: st.error("Invalid Username or Password")
-    # APP SCREEN
+                    else: st.error("Invalid")
     else:
         user = session.query(User).filter_by(id=st.session_state.user_id).first()
         if not user:
@@ -562,8 +457,7 @@ def main():
             st.rerun()
             
         with st.sidebar:
-            st.write(f"Logged in as: **{user.username}**")
-            st.write(f"Role: {user.role.upper()}")
+            st.write(f"User: {user.username}")
             if st.button("Logout"):
                 st.session_state.user_id = None
                 st.rerun()
