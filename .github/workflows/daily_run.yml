@@ -1,38 +1,25 @@
 name: Daily Portfolio Update
 
 on:
-  # Schedule: Runs at 13:30 UTC (which is 9:30 AM EST / 21:30 SG/HK Time)
-  # GitHub Actions uses UTC time. You must convert your local market open time to UTC.
   schedule:
-    - cron: '30 13 * * 1-5' # Mon-Fri
-  
-  # Manual Trigger: Allows you to click a button to run it anytime (Essential for testing)
-  workflow_dispatch:
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:  # <--- This line is what creates the button!
 
 jobs:
-  run-analytics-script:
+  run-script:
     runs-on: ubuntu-latest
-    
     steps:
-      # 1. Check out the repository code
       - uses: actions/checkout@v3
-
-      # 2. Set up Python environment
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-
-      # 3. Install dependencies from requirements.txt
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-
-      # 4. Run the Python script
       - name: Run Daily Job
         env:
-          # This maps the GitHub Secrets to Python's os.environ
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}    <-- Uncomment if you added this secret
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }} <-- Uncomment if you added this secret
         run: python daily_job.py
