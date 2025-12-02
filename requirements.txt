@@ -4,3 +4,5 @@ sqlalchemy
 yfinance
 bcrypt
 psycopg2-binary
+toml
+plotly
