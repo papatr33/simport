@@ -1,0 +1,6 @@
+streamlit
+pandas
+sqlalchemy
+yfinance
+bcrypt
+psycopg2-binary
