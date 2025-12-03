@@ -85,8 +85,15 @@ class SystemConfig(Base):
     value = Column(String) 
 
 engine = get_db_engine()
-try: Base.metadata.create_all(engine)
-except: pass
+
+# --- CRITICAL CHANGE: Removing silent failure ---
+# If table creation fails, we want to know immediately rather than crashing later.
+try:
+    Base.metadata.create_all(engine)
+except Exception as e:
+    st.error(f"Failed to connect to Database or Create Tables: {e}")
+    st.stop()
+
 Session = sessionmaker(bind=engine)
 session = Session()
 
