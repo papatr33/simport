@@ -179,7 +179,11 @@ def calculate_portfolio_state(user_id, session_obj):
     for t in txs:
         tik = t.ticker
         if tik not in state["positions"]:
-            state["positions"][tik] = {"qty": 0.0, "avg_cost": 0.0, "type": "FLAT", "market": t.market}
+            state["positions"][tik] = {
+                "qty": 0.0, "avg_cost": 0.0, 
+                "type": "FLAT", "market": t.market, 
+                "first_entry": None
+            }
         
         pos = state["positions"][tik]
         
@@ -189,6 +193,7 @@ def calculate_portfolio_state(user_id, session_obj):
             pos["qty"] += t.quantity
             pos["avg_cost"] = new_val / pos["qty"] if pos["qty"] > 0 else 0.0
             pos["type"] = "LONG"
+            if not pos["first_entry"]: pos["first_entry"] = t.date
 
         elif t.trans_type == "SELL":
             state["cash"] += t.amount
@@ -196,7 +201,8 @@ def calculate_portfolio_state(user_id, session_obj):
             pnl = t.amount - cost_basis
             state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
             pos["qty"] -= t.quantity
-            if pos["qty"] <= 0.001: del state["positions"][tik]
+            if pos["qty"] <= 0.001: 
+                del state["positions"][tik]
 
         elif t.trans_type == "SHORT_SELL":
             state["cash"] += t.amount
@@ -205,6 +211,7 @@ def calculate_portfolio_state(user_id, session_obj):
             pos["qty"] -= t.quantity
             pos["avg_cost"] = new_val / abs(pos["qty"]) if abs(pos["qty"]) > 0 else 0.0
             pos["type"] = "SHORT"
+            if not pos["first_entry"]: pos["first_entry"] = t.date
 
         elif t.trans_type == "BUY_TO_COVER":
             state["cash"] -= t.amount
@@ -212,7 +219,8 @@ def calculate_portfolio_state(user_id, session_obj):
             pnl = cost_basis - t.amount
             state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
             pos["qty"] += t.quantity
-            if abs(pos["qty"]) <= 0.001: del state["positions"][tik]
+            if abs(pos["qty"]) <= 0.001: 
+                del state["positions"][tik]
 
     # Live Mark to Market
     active_tickers = list(state["positions"].keys())
@@ -263,8 +271,6 @@ def get_ytd_performance(user_id, session_obj):
     txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
     user = session_obj.query(User).filter_by(id=user_id).first()
     
-    # Define Timeframe: YTD or from first trade if simpler
-    # Standard YTD: Jan 1 current year
     current_year = datetime.now().year
     start_date = datetime(current_year, 1, 1)
     end_date = datetime.now()
@@ -279,31 +285,23 @@ def get_ytd_performance(user_id, session_obj):
     # Get Tickers involved in history
     tickers = list(set([t.ticker for t in txs]))
     
-    # Fetch data starting slightly before Jan 1 for lookback if needed
     fetch_start = min(start_date, txs[0].date) - timedelta(days=5)
     batch_data = fetch_batch_data(tickers, fetch_start)
     
-    # Generate Business Days Range
     dates = pd.date_range(start=start_date, end=end_date, freq='B')
     
     curve = []
     
-    # Optimization: Map Tickers
     if not batch_data.empty:
         batch_data.index = pd.to_datetime(batch_data.index).normalize()
     
     curr_cash = user.initial_capital
     holdings = {}
     
-    # Pre-process transactions into a DataFrame for easier slicing
-    # We need to process ALL transactions from the beginning of time to get correct cash/holdings state at Jan 1
-    # Then we record daily state from Jan 1 onwards.
-    
     tx_idx = 0
     n_txs = len(txs)
     
-    # 1. Roll forward to Jan 1 (Start of Chart)
-    #    Process all txs before start_date to set initial state
+    # 1. Roll forward to Jan 1
     while tx_idx < n_txs and txs[tx_idx].date < start_date:
         t = txs[tx_idx]
         if t.trans_type == 'BUY':
@@ -320,11 +318,10 @@ def get_ytd_performance(user_id, session_obj):
             holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
         tx_idx += 1
 
-    # 2. Daily Loop for Chart
+    # 2. Daily Loop
     for d in dates:
         d_norm = d.normalize()
         
-        # Apply transactions for this day
         while tx_idx < n_txs and txs[tx_idx].date.date() <= d_norm.date():
             t = txs[tx_idx]
             if t.trans_type == 'BUY':
@@ -341,21 +338,16 @@ def get_ytd_performance(user_id, session_obj):
                 holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
             tx_idx += 1
             
-        # Value Holdings using data (with ffill from fetch)
         long_val = 0.0
         short_val = 0.0
         
         if not batch_data.empty:
-            # We look for the date, or the last available date before it (ffill logic is in fetch, but we need safe lookup)
             try:
-                # Asof or direct lookup if freq matches
                 if d_norm in batch_data.index:
                     row = batch_data.loc[d_norm]
                 else:
-                    # Find closest previous date
                     idx = batch_data.index.get_indexer([d_norm], method='pad')[0]
-                    if idx != -1:
-                        row = batch_data.iloc[idx]
+                    if idx != -1: row = batch_data.iloc[idx]
                     else: row = pd.Series()
 
                 if not row.empty:
@@ -374,11 +366,9 @@ def get_ytd_performance(user_id, session_obj):
     df_curve = pd.DataFrame(curve)
     df_curve['Return %'] = ((df_curve['Equity'] / user.initial_capital) - 1) * 100
     
-    # SPY Benchmark (Normalized)
     spy_ret = pd.Series()
     try:
         spy = fetch_batch_data(["SPY"], fetch_start)
-        # Filter for chart range
         spy = spy[(spy.index >= pd.Timestamp(start_date)) & (spy.index <= pd.Timestamp(end_date))]
         if not spy.empty and 'SPY' in spy.columns:
             start_price = extract_scalar(spy['SPY'].iloc[0])
@@ -455,13 +445,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
         
         pnl_val = state['equity'] - user.initial_capital
         pnl_pct = (pnl_val / user.initial_capital) * 100
-        color = "normal"
-        if pnl_val > 0: color="success"
-        elif pnl_val < 0: color="inverse"
         
         c3.metric("YTD PnL ($)", f"${pnl_val:,.0f}", delta=f"{pnl_pct:.2f}%")
         
-        # Exposure
         long_exp = sum(p['mkt_val'] for p in state['positions'].values() if p['type'] == 'LONG')
         short_exp = sum(p['mkt_val'] for p in state['positions'].values() if p['type'] == 'SHORT')
         net_exp = long_exp - short_exp
@@ -469,46 +455,82 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     st.markdown("---")
 
-    # 2. Charts
-    df_c, spy_c = get_ytd_performance(user.id, session_obj)
-    render_chart(df_c, spy_c)
+    # 2. Charts & Tables Tabs
+    t1, t2, t3 = st.tabs(["Performance Chart", "Current Holdings", "Transaction Log"])
     
-    st.markdown("---")
-
-    # 3. Holdings
-    st.subheader("Current Holdings")
-    holdings_data = []
-    for tik, pos in state['positions'].items():
-        pnl = pos.get('unrealized', 0)
-        holdings_data.append({
-            "Ticker": tik, "Type": pos['type'], "Market": pos['market'],
-            "Qty": f"{pos['qty']:.2f}", 
-            "Avg Cost": f"${pos['avg_cost']:,.2f}", 
-            "Current Price": f"${pos.get('current_price',0):,.2f}",
-            "Market Val": pos.get('mkt_val', 0),
-            "Unrealized PnL": pnl,
-            "Return %": (pnl / (pos['qty']*pos['avg_cost']))*100 if pos['qty']!=0 else 0
-        })
-    
-    if holdings_data:
-        h_df = pd.DataFrame(holdings_data)
-        # Styling for the table
-        st.dataframe(
-            h_df.style.format({
-                "Market Val": "${:,.0f}", 
-                "Unrealized PnL": "${:,.0f}",
-                "Return %": "{:.2f}%"
-            }).background_gradient(subset=["Unrealized PnL", "Return %"], cmap="RdYlGn", vmin=-5000, vmax=5000),
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("No active positions.")
+    with t1:
+        df_c, spy_c = get_ytd_performance(user.id, session_obj)
+        render_chart(df_c, spy_c)
+        
+    with t2:
+        st.subheader("Current Holdings")
+        holdings_data = []
+        for tik, pos in state['positions'].items():
+            pnl = pos.get('unrealized', 0)
+            holdings_data.append({
+                "Ticker": tik, "Type": pos['type'], "Market": pos['market'],
+                "Qty": f"{pos['qty']:.2f}", 
+                "Avg Cost": f"${pos['avg_cost']:,.2f}", 
+                "Current Price": f"${pos.get('current_price',0):,.2f}",
+                "Market Val": pos.get('mkt_val', 0),
+                "Unrealized PnL": pnl,
+                "Return %": (pnl / (pos['qty']*pos['avg_cost']))*100 if pos['qty']!=0 else 0,
+                "Entry Date": pos.get('first_entry').strftime('%Y-%m-%d') if pos.get('first_entry') else '-'
+            })
+        
+        if holdings_data:
+            h_df = pd.DataFrame(holdings_data)
+            st.dataframe(
+                h_df.style.format({
+                    "Market Val": "${:,.0f}", 
+                    "Unrealized PnL": "${:,.0f}",
+                    "Return %": "{:.2f}%"
+                }).background_gradient(subset=["Unrealized PnL", "Return %"], cmap="RdYlGn", vmin=-5000, vmax=5000),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No active positions.")
+            
+    with t3:
+        st.subheader("Transaction History")
+        hist_txs = session_obj.query(Transaction).filter_by(user_id=user.id).order_by(Transaction.date.desc()).all()
+        if hist_txs:
+            hist_data = []
+            for t in hist_txs:
+                hist_data.append({
+                    "Date": t.date.strftime('%Y-%m-%d'),
+                    "Ticker": t.ticker,
+                    "Type": t.trans_type,
+                    "Amount": t.amount,
+                    "Price": t.price if t.price else 0,
+                    "Quantity": t.quantity if t.quantity else 0,
+                    "Status": t.status,
+                    "Notes": t.notes
+                })
+            
+            h_df = pd.DataFrame(hist_data)
+            st.dataframe(
+                h_df.style.format({"Amount": "${:,.0f}", "Price": "${:,.2f}", "Quantity": "{:,.2f}"}),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("No transactions found.")
 
     # 4. Order Entry (HIDDEN FOR PM)
     if not is_pm_view:
         st.markdown("---")
         st.subheader("⚡ Execute Trade")
+        
+        # Display Compliance Rules
+        with st.expander("Compliance Rules Summary"):
+            st.markdown("""
+            * **Longs:** Max 5 names. Position Size: \$500k - \$2M.
+            * **Shorts:** Max 3 names. Position Size: \$300k - \$1.2M. Total Short: Max \$3M.
+            * **Cash:** Must not exceed \$1.5M (Selling disallowed if Cash > \$1.5M).
+            * **Lockup:** Must hold new positions for at least 30 Days.
+            """)
+
         with st.form("order_form", clear_on_submit=True):
             col_a, col_b, col_c, col_d = st.columns(4)
             mkt = col_a.selectbox("Market", list(MARKET_CONFIG.keys()))
@@ -527,35 +549,93 @@ def analyst_page(user, session_obj, is_pm_view=False):
             
             if submitted:
                 if not tik: st.error("Ticker is required"); st.stop()
-                
                 final_tik = format_ticker(tik, mkt)
                 
-                # Check Compliance (Simplified)
-                # ... (Keep existing checks if needed, skipping for brevity in this refactor)
+                # --- COMPLIANCE ENGINE ---
+                error_msg = None
                 
-                if test_mode:
-                    h_date = datetime.combine(d_val, datetime.min.time())
-                    local_p, usd_p = get_historical_price(final_tik, h_date, mkt)
-                    if usd_p > 0:
-                        qty = amt / usd_p
+                # Pre-calculate metrics
+                current_longs = [p for p in state['positions'].values() if p['type'] == 'LONG']
+                current_shorts = [p for p in state['positions'].values() if p['type'] == 'SHORT']
+                current_pos = state['positions'].get(final_tik)
+                
+                # 1. CASH LIMIT RULE (For Sells)
+                # If Selling, Cash increases. Must not exceed 1.5M
+                if side in ['SELL', 'SHORT_SELL']:
+                    projected_cash = state['cash'] + amt
+                    if projected_cash > 1500000:
+                        error_msg = f"Compliance Violation: Sale would result in Cash > $1.5M (${projected_cash:,.0f}). You must stay invested."
+
+                # 2. LOCKUP RULE (For Closing Trades)
+                if side in ['SELL', 'BUY_TO_COVER']:
+                    # Use provided backdate if test mode, else now
+                    curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
+                    
+                    if current_pos and current_pos['first_entry']:
+                        days_held = (curr_date - current_pos['first_entry']).days
+                        if days_held < 30:
+                            error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding period is 30 days."
+                    else:
+                        # Should not happen if logic is sound, but if flat...
+                        if not current_pos: error_msg = "Cannot close a position you don't hold."
+
+                # 3. LONG RULES
+                if side == 'BUY':
+                    # A. Count Limit (if new name)
+                    if not current_pos and len(current_longs) >= 5:
+                        error_msg = "Compliance Violation: Max 5 Long positions allowed."
+                    
+                    # B. Position Sizing ($500k - $2M)
+                    # Current Value + New Amount
+                    curr_val = current_pos['mkt_val'] if current_pos and current_pos['type']=='LONG' else 0
+                    proj_val = curr_val + amt
+                    if not (500000 <= proj_val <= 2000000):
+                        error_msg = f"Compliance Violation: Long Position Size must be \$500k - \$2M. Projected: \${proj_val:,.0f}"
+
+                # 4. SHORT RULES
+                if side == 'SHORT_SELL':
+                    # A. Count Limit
+                    if not current_pos and len(current_shorts) >= 3:
+                        error_msg = "Compliance Violation: Max 3 Short positions allowed."
+                    
+                    # B. Position Sizing ($300k - $1.2M)
+                    curr_val = current_pos['mkt_val'] if current_pos and current_pos['type']=='SHORT' else 0
+                    proj_val = curr_val + amt
+                    if not (300000 <= proj_val <= 1200000):
+                        error_msg = f"Compliance Violation: Short Position Size must be \$300k - \$1.2M. Projected: \${proj_val:,.0f}"
+                        
+                    # C. Total Short Notional Limit ($3M)
+                    total_short_exposure = sum(p['mkt_val'] for p in current_shorts)
+                    if (total_short_exposure + amt) > 3000000:
+                        error_msg = f"Compliance Violation: Total Short Exposure cannot exceed \$3M."
+
+                # EXECUTION OR REJECTION
+                if error_msg:
+                    st.error(error_msg)
+                else:
+                    if test_mode:
+                        h_date = datetime.combine(d_val, datetime.min.time())
+                        local_p, usd_p = get_historical_price(final_tik, h_date, mkt)
+                        if usd_p > 0:
+                            qty = amt / usd_p
+                            session_obj.add(Transaction(
+                                user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
+                                status='FILLED', date=h_date, amount=amt, quantity=qty,
+                                local_price=local_p, price=usd_p, notes=f"[BACKDATE] {note}"
+                            ))
+                            session_obj.commit()
+                            st.success(f"Filled {side} {final_tik} @ ${usd_p:.2f}")
+                            time.sleep(1); st.rerun()
+                        else:
+                            st.error("Could not fetch historical price.")
+                    else:
                         session_obj.add(Transaction(
                             user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
-                            status='FILLED', date=h_date, amount=amt, quantity=qty,
-                            local_price=local_p, price=usd_p, notes=f"[BACKDATE] {note}"
+                            status='PENDING', amount=amt, notes=note
                         ))
                         session_obj.commit()
-                        st.success(f"Filled {side} {final_tik} @ ${usd_p:.2f}")
+                        st.success("Order queued for Next Open execution.")
                         time.sleep(1); st.rerun()
-                    else:
-                        st.error("Could not fetch historical price.")
-                else:
-                    session_obj.add(Transaction(
-                        user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
-                        status='PENDING', amount=amt, notes=note
-                    ))
-                    session_obj.commit()
-                    st.success("Order queued for Next Open execution.")
-                    time.sleep(1); st.rerun()
 
 def pm_page(user, session_obj):
     st.title("👨‍💼 Portfolio Manager Dashboard")
@@ -587,19 +667,10 @@ def pm_page(user, session_obj):
         # Calculate Monthly Breakdown
         df_c, _ = get_ytd_performance(a.id, session_obj)
         if not df_c.empty:
-            # Resample to month end
             m_df = df_c.set_index('Date').resample('ME').last()
-            # Calculate monthly diff in equity or return? Return is better.
             m_df['Monthly Ret'] = m_df['Equity'].pct_change() * 100
-            # Handle first month (pct_change is NaN) -> (Equity / Init) - 1
-            if len(m_df) > 0:
-                first_eq = m_df['Equity'].iloc[0]
-                # Approximation for first month
-                pass 
             
-            # Create dict for heatmap
-            m_ret = m_df['Monthly Ret'].fillna(0).to_dict() # {Timestamp: float}
-            # Convert keys to Mon-YY string
+            m_ret = m_df['Monthly Ret'].fillna(0).to_dict() 
             formatted_ret = {k.strftime('%b'): v for k, v in m_ret.items() if k.year == datetime.now().year}
             monthly_map[a.username] = formatted_ret
             
@@ -624,8 +695,7 @@ def pm_page(user, session_obj):
     with c2:
         st.subheader("Monthly Returns Matrix (%)")
         if monthly_map:
-            heatmap_df = pd.DataFrame(monthly_map).T # Analysts as Rows
-            # Reorder months?
+            heatmap_df = pd.DataFrame(monthly_map).T 
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             existing_cols = [m for m in months if m in heatmap_df.columns]
             heatmap_df = heatmap_df[existing_cols]
@@ -709,9 +779,7 @@ def admin_page(session_obj):
                 time.sleep(1); st.rerun()
 
 def main():
-    # Session handling
     session = Session()
-    # Init Admin if fresh DB
     try:
         if not session.query(User).filter_by(username='admin').first():
             session.add(User(username='admin', password_hash=bcrypt.hashpw('8848'.encode(), bcrypt.gensalt()).decode(), role='admin'))
@@ -721,7 +789,6 @@ def main():
     if 'user_id' not in st.session_state: st.session_state.user_id = None
     
     if not st.session_state.user_id:
-        # Login Screen
         col1, col2, col3 = st.columns([1,1,1])
         with col2:
             st.markdown("<br><br>", unsafe_allow_html=True)
@@ -738,13 +805,11 @@ def main():
                     else:
                         st.error("Invalid credentials")
     else:
-        # Logged In
         user = session.query(User).filter_by(id=st.session_state.user_id).first()
         if not user:
             st.session_state.user_id = None
             st.rerun()
 
-        # Sidebar
         with st.sidebar:
             st.markdown(f"### 👤 {user.username}")
             st.caption(f"Role: {user.role.upper()}")
@@ -755,7 +820,6 @@ def main():
             st.markdown("---")
             st.caption("AlphaTracker v2.0")
 
-        # Routing
         if user.role == 'admin':
             admin_page(session)
         elif user.role == 'analyst':
