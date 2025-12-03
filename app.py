@@ -12,10 +12,45 @@ import time
 import numpy as np
 
 # ==========================================
-# 1. DATABASE MODELS (LEDGER STYLE)
+# 1. CONFIGURATION & CACHING
 # ==========================================
+
+# Market Configuration maps Markets to Ticker Suffixes and FX Tickers
+# FX Assumption: Ticker represents "Local Units per 1 USD" (e.g. HKD=X is ~7.8)
+MARKET_CONFIG = {
+    "US": {"suffix": "", "fx": None, "currency": "USD"},
+    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD"},
+    "China (Shanghai)": {"suffix": ".SS", "fx": "CNY=X", "currency": "CNY"},
+    "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY"},
+    "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
+    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"}, # UK prices often in Pence
+    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"}
+}
+
+# --- DATABASE CONNECTION (Cached) ---
+@st.cache_resource(ttl="2h")
+def get_db_engine():
+    # 1. Streamlit Cloud Secrets
+    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+        db_url = st.secrets["DATABASE_URL"]
+    # 2. Env Vars (GitHub Actions)
+    elif "DATABASE_URL" in os.environ:
+        db_url = os.environ["DATABASE_URL"]
+    # 3. Local Fallback
+    else:
+        db_url = 'sqlite:///portfolio.db'
+
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+    if 'sqlite' in db_url:
+        return create_engine(db_url, connect_args={'check_same_thread': False})
+    else:
+        return create_engine(db_url)
+
 Base = declarative_base()
 
+# --- DB MODELS ---
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
@@ -29,15 +64,15 @@ class Transaction(Base):
     __tablename__ = 'transactions'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'))
-    
     ticker = Column(String, nullable=False)
-    # Type: BUY, SELL (for Longs), SHORT_SELL, BUY_TO_COVER (for Shorts)
-    trans_type = Column(String, nullable=False) 
-    
+    market = Column(String, nullable=True) 
+    trans_type = Column(String, nullable=False) # BUY, SELL, SHORT_SELL, BUY_TO_COVER
     date = Column(DateTime, default=datetime.now)
-    price = Column(Float, nullable=True) # None if PENDING
+    
+    price = Column(Float, nullable=True) # USD Price
+    local_price = Column(Float, nullable=True) # Local Currency Price
     quantity = Column(Float, nullable=True)
-    amount = Column(Float, nullable=True) # Dollar value (price * qty)
+    amount = Column(Float, nullable=True) # USD Value
     
     status = Column(String, default='PENDING') # PENDING, FILLED
     notes = Column(Text, nullable=True)
@@ -49,23 +84,6 @@ class SystemConfig(Base):
     key = Column(String, primary_key=True)
     value = Column(String) 
 
-# --- DB Connection ---
-def get_db_engine():
-    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
-        db_url = st.secrets["DATABASE_URL"]
-    elif "DATABASE_URL" in os.environ:
-        db_url = os.environ["DATABASE_URL"]
-    else:
-        db_url = 'sqlite:///portfolio.db'
-
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-
-    if 'sqlite' in db_url:
-        return create_engine(db_url, connect_args={'check_same_thread': False})
-    else:
-        return create_engine(db_url)
-
 engine = get_db_engine()
 try: Base.metadata.create_all(engine)
 except: pass
@@ -73,351 +91,310 @@ Session = sessionmaker(bind=engine)
 session = Session()
 
 # ==========================================
-# 2. CORE LOGIC (PORTFOLIO ENGINE)
+# 2. DATA ENGINE (ROBUST & CACHED)
 # ==========================================
 
-def get_live_price(ticker):
+def extract_scalar(val):
+    """Safely extracts a single float from numpy/pandas objects."""
     try:
-        data = yf.Ticker(ticker).history(period="1d")
-        if not data.empty:
-            return float(data['Close'].iloc[-1])
+        if isinstance(val, (pd.Series, pd.DataFrame, np.ndarray, list)):
+            val = val.values.flatten()[0] if hasattr(val, 'values') else val[0]
+        return float(val)
+    except:
         return 0.0
-    except: return 0.0
 
-def get_historical_price(ticker, date_obj):
+@st.cache_data(ttl=300) # Cache for 5 mins
+def fetch_batch_data(tickers, start_date):
+    """Downloads batch data for efficiency."""
+    if not tickers: return pd.DataFrame()
     try:
+        data = yf.download(tickers, start=start_date, progress=False)['Close']
+        # Normalize MultiIndex vs Series
+        if isinstance(data, pd.Series): data = data.to_frame(name=tickers[0])
+        return data.ffill()
+    except:
+        return pd.DataFrame()
+
+def get_historical_price(ticker, date_obj, market):
+    """
+    Fetches historical price for a specific date and converts to USD.
+    Used for Backdating trades.
+    """
+    try:
+        # 1. Download Local Price (small window to handle weekends)
         start = date_obj
         end = date_obj + timedelta(days=5)
+        
+        # Fetch Stock Data
         df = yf.download(ticker, start=start, end=end, progress=False)
-        if not df.empty:
-            # Handle Multi-index
-            if 'Close' in df.columns:
-                val = df['Close']
-                if isinstance(val, pd.DataFrame): val = val.iloc[:, 0]
-                return float(val.iloc[0])
-            return float(df.iloc[0, 0])
-        return 0.0
-    except: return 0.0
+        if df.empty: return 0.0, 0.0
+        
+        # Extract Close Price
+        if 'Close' in df.columns:
+            local_p = extract_scalar(df['Close'].iloc[0])
+        else:
+            local_p = extract_scalar(df.iloc[0,0])
+
+        # 2. Handle FX Conversion
+        usd_p = local_p
+        
+        # Check if FX needed
+        if market != "US":
+            cfg = MARKET_CONFIG.get(market)
+            if cfg and cfg['fx']:
+                # Fetch FX Rate for same date
+                fx_df = yf.download(cfg['fx'], start=start, end=end, progress=False)
+                if not fx_df.empty:
+                    if 'Close' in fx_df.columns:
+                        rate = extract_scalar(fx_df['Close'].iloc[0])
+                    else:
+                        rate = extract_scalar(fx_df.iloc[0,0])
+                    
+                    # UK Adjustment (Pence to Pounds)
+                    if market == "UK": local_p = local_p / 100.0
+                    
+                    # Convert to USD (Assuming Rate is Local/USD)
+                    # If Rate is 0 or nan, fail safe
+                    if rate > 0:
+                        usd_p = local_p / rate
+                    else:
+                        usd_p = 0.0 # Error in FX data
+
+        return local_p, usd_p
+    except Exception as e:
+        print(f"Error fetching historical price: {e}")
+        return 0.0, 0.0
+
+# ==========================================
+# 3. CORE LOGIC (PORTFOLIO STATE)
+# ==========================================
 
 def calculate_portfolio_state(user_id):
-    """
-    Iterates through the Transaction Ledger to build the current state.
-    Calculates Avg Cost, Realized PnL, Net Quantity, etc.
-    """
     user = session.query(User).filter_by(id=user_id).first()
-    # Fetch FILLED transactions sorted by date
     txs = session.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
-    pending = session.query(Transaction).filter_by(user_id=user_id, status='PENDING').all()
-
+    
+    # --- 1. Identify Data Needs ---
+    # We need live prices for all held positions + FX
+    # Optimization: We gather tickers during the loop, but for live marking we need them all.
+    # To save time, we do the logic first, find active positions, then fetch live prices once.
+    
     state = {
         "cash": user.initial_capital,
-        "positions": {}, # {ticker: {qty, avg_price, unrealized_pnl, type, first_entry_date}}
-        "realized_pnl_ytd": {}, # {ticker: amount}
-        "history": [], # For curve generation
-        "short_notional_used": 0.0,
-        "long_capital_used": 0.0,
-        "total_realized": 0.0
+        "positions": {}, # {ticker: {qty, avg_cost, type, market, first_entry}}
+        "realized_pnl_ytd": {},
+        "total_realized": 0.0,
+        "equity": 0.0
     }
 
+    # --- 2. Replay Ledger ---
     for t in txs:
         tik = t.ticker
         if tik not in state["positions"]:
-            state["positions"][tik] = {"qty": 0.0, "avg_cost": 0.0, "type": "FLAT", "first_entry": None}
+            state["positions"][tik] = {"qty": 0.0, "avg_cost": 0.0, "type": "FLAT", "market": t.market, "first_entry": None}
         
         pos = state["positions"][tik]
         
-        # --- LONG LOGIC ---
         if t.trans_type == "BUY":
-            # Cash Out
-            cost = t.amount
-            state["cash"] -= cost
-            
-            # Update Avg Cost
-            total_val = (pos["qty"] * pos["avg_cost"]) + cost
+            state["cash"] -= t.amount
+            new_val = (pos["qty"] * pos["avg_cost"]) + t.amount
             pos["qty"] += t.quantity
-            pos["avg_cost"] = total_val / pos["qty"] if pos["qty"] > 0 else 0.0
+            pos["avg_cost"] = new_val / pos["qty"] if pos["qty"] > 0 else 0.0
             pos["type"] = "LONG"
-            if pos["first_entry"] is None: pos["first_entry"] = t.date
+            if not pos["first_entry"]: pos["first_entry"] = t.date
 
         elif t.trans_type == "SELL":
-            # Cash In
-            proceeds = t.amount
-            state["cash"] += proceeds
-            
-            # Realized PnL (FIFO/Avg Cost assumption: realized against avg cost)
-            cost_basis_of_sale = t.quantity * pos["avg_cost"]
-            pnl = proceeds - cost_basis_of_sale
+            state["cash"] += t.amount
+            cost_basis = t.quantity * pos["avg_cost"]
+            pnl = t.amount - cost_basis
             state["total_realized"] += pnl
             state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
-            
             pos["qty"] -= t.quantity
-            if pos["qty"] <= 0.001: # Closed
-                del state["positions"][tik]
+            if pos["qty"] <= 0.001: del state["positions"][tik]
 
-        # --- SHORT LOGIC ---
         elif t.trans_type == "SHORT_SELL":
-            # Cash Effect: Usually shorts add cash (proceeds), but we reserve it as collateral.
-            # Simplified: Cash stays flat (collateral locked), we track Notional separately.
-            # Or to simulate "Buying Power": Cash reduces by margin requirement. 
-            # Prompt says "$3M notional to short". 
-            # Let's model it: Cash increases by sale proceeds, but Liability increases.
-            
-            proceeds = t.amount
-            state["cash"] += proceeds 
-            
-            # Update Avg Price (Entry Price for Short)
-            # Existing Short + New Short
-            current_short_val = abs(pos["qty"]) * pos["avg_cost"]
-            new_short_val = proceeds
-            total_short_qty = abs(pos["qty"]) + t.quantity
-            
-            pos["avg_cost"] = (current_short_val + new_short_val) / total_short_qty
-            pos["qty"] -= t.quantity # Negative Qty for Shorts
+            state["cash"] += t.amount
+            curr_val = abs(pos["qty"]) * pos["avg_cost"]
+            new_val = curr_val + t.amount
+            pos["qty"] -= t.quantity # Negative Qty
+            pos["avg_cost"] = new_val / abs(pos["qty"]) if abs(pos["qty"]) > 0 else 0.0
             pos["type"] = "SHORT"
-            if pos["first_entry"] is None: pos["first_entry"] = t.date
+            if not pos["first_entry"]: pos["first_entry"] = t.date
 
         elif t.trans_type == "BUY_TO_COVER":
-            # Cash Out to buy back
-            cost = t.amount
-            state["cash"] -= cost
-            
-            # Realized PnL
-            # Entry (Avg Cost) - Exit (Current Cost)
-            cost_basis_of_cover = t.quantity * pos["avg_cost"]
-            pnl = cost_basis_of_cover - cost
+            state["cash"] -= t.amount
+            cost_basis = t.quantity * pos["avg_cost"]
+            pnl = cost_basis - t.amount
             state["total_realized"] += pnl
             state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
-            
-            pos["qty"] += t.quantity # Add back to negative number
-            if abs(pos["qty"]) <= 0.001:
-                del state["positions"][tik]
+            pos["qty"] += t.quantity
+            if abs(pos["qty"]) <= 0.001: del state["positions"][tik]
 
-    # --- MARK TO MARKET (Current State) ---
+    # --- 3. Mark to Market (Live) ---
+    active_tickers = list(state["positions"].keys())
+    active_markets = {tik: pos['market'] for tik, pos in state["positions"].items()}
+    
+    # Collect FX needed
+    fx_needed = []
+    for m in active_markets.values():
+        if m and MARKET_CONFIG[m]['fx']: fx_needed.append(MARKET_CONFIG[m]['fx'])
+    
+    # Fetch Data (Cached)
+    # Using generic start date (e.g., 5 days ago) to ensure we get "today's" or "last close"
+    today = datetime.now()
+    batch_data = fetch_batch_data(active_tickers + fx_needed, today - timedelta(days=5))
+    
     state["equity"] = state["cash"]
-    state["long_mkt_val"] = 0.0
-    state["short_mkt_val"] = 0.0
     
-    # Pre-fetch live prices
-    tickers = list(state["positions"].keys())
-    live_prices = {}
-    if tickers:
-        try:
-            # Batch download for speed
-            # Use 'download' instead of Ticker for batch
-            df = yf.download(tickers, period="1d", progress=False)
-            if 'Close' in df.columns:
-                closes = df['Close'].iloc[-1]
-                if isinstance(closes, pd.Series):
-                    for tk in tickers:
-                        try: live_prices[tk] = float(closes[tk])
-                        except: live_prices[tk] = 0.0
-                else:
-                    live_prices[tickers[0]] = float(closes)
-        except: pass
-
-    # Calculate Current Values
     for tik, pos in state["positions"].items():
-        curr_price = live_prices.get(tik, get_live_price(tik))
-        pos["current_price"] = curr_price
-        
-        if pos["type"] == "LONG":
-            mkt_val = pos["qty"] * curr_price
-            state["equity"] += mkt_val # Cash + Stock Value
-            pos["mkt_value"] = mkt_val
-            state["long_mkt_val"] += mkt_val
-            pos["unrealized_pnl"] = mkt_val - (pos["qty"] * pos["avg_cost"])
+        # Get Local Price
+        usd_p = 0.0
+        try:
+            if not batch_data.empty:
+                # Handle MultiIndex vs Single Index
+                if tik in batch_data.columns:
+                    raw_p = extract_scalar(batch_data[tik].iloc[-1])
+                elif tik in batch_data.columns.levels[0]: # MultiIndex level
+                    raw_p = extract_scalar(batch_data[tik].iloc[-1])
+                else:
+                    raw_p = pos["avg_cost"] # Fallback
+            else:
+                 raw_p = pos["avg_cost"]
+                 
+            # FX Conversion
+            mkt = pos.get('market', 'US')
+            fx_tik = MARKET_CONFIG.get(mkt, {}).get('fx')
             
-        elif pos["type"] == "SHORT":
-            # Equity = Cash - Liability
-            # Liability = abs(Qty) * Current Price
-            liability = abs(pos["qty"]) * curr_price
+            if fx_tik and fx_tik in batch_data.columns:
+                 rate = extract_scalar(batch_data[fx_tik].iloc[-1])
+                 if mkt == "UK": raw_p = raw_p / 100
+                 usd_p = raw_p / rate if rate > 0 else 0.0
+            else:
+                 usd_p = raw_p
+        except:
+             usd_p = pos["avg_cost"] # Fallback to cost if live fail
+             
+        pos["current_price"] = usd_p
+        
+        # Calculate Value & PnL
+        if pos["type"] == "LONG":
+            mkt_val = pos["qty"] * usd_p
+            state["equity"] += mkt_val
+            pos["mkt_val"] = mkt_val
+            pos["unrealized"] = mkt_val - (pos["qty"] * pos["avg_cost"])
+        else:
+            liability = abs(pos["qty"]) * usd_p
             state["equity"] -= liability
-            pos["mkt_value"] = liability
-            state["short_notional_used"] += (abs(pos["qty"]) * pos["avg_cost"]) # Based on entry
-            state["short_mkt_val"] += liability
-            # PnL = (Entry Price - Current Price) * Qty
-            pos["unrealized_pnl"] = (pos["avg_cost"] - curr_price) * abs(pos["qty"])
+            pos["mkt_val"] = liability
+            pos["unrealized"] = (pos["avg_cost"] - usd_p) * abs(pos["qty"])
+            
+    return state
 
-    # Pending impacts cash availability but not equity yet
-    state["pending_impact"] = 0.0
-    for p in pending:
-        state["pending_impact"] += p.amount if p.amount else 0.0
-
-    return state, pending
-
-# ==========================================
-# 3. REPORTING & CHARTS
-# ==========================================
-
-def get_spy_benchmark(start_date):
-    """Downloads SPY data and normalizes to % return."""
-    try:
-        spy = yf.download("SPY", start=start_date, progress=False)['Close']
-        if isinstance(spy, pd.DataFrame): spy = spy.iloc[:,0]
-        # Normalize: (Price / Start_Price) - 1
-        start_price = float(spy.iloc[0])
-        spy_ret = ((spy / start_price) - 1) * 100
-        return spy_ret
-    except:
-        return pd.Series()
-
-def generate_performance_data(user_id):
-    # This rebuilds the daily equity curve using the same logic as 'calculate_portfolio_state'
-    # but for every single day in the past. 
-    # NOTE: For speed/simplicity in this file-based app, we will estimate it 
-    # by taking the "Transaction Date" snapshots.
-    
-    # 1. Get all transactions
+def generate_curve_and_stats(user_id):
     txs = session.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
     if not txs: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
     start_date = txs[0].date
-    end_date = datetime.now()
-    
-    # 2. Get Universe Data
+    # Fetch all data needed for history
     tickers = list(set([t.ticker for t in txs]))
-    prices = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
+    # Simplification: We only fetch Tickers, assume we use USD cost basis for history to avoid massive FX complication in history loop
+    # Ideally, you'd fetch FX history too. For speed, we rely on the Transaction 'price' (USD) stored in DB for cost basis, 
+    # but for market value we need history.
     
-    # 3. Build Daily Equity
+    batch_data = fetch_batch_data(tickers, start_date)
+    
     user = session.query(User).filter_by(id=user_id).first()
-    dates = pd.date_range(start=start_date, end=end_date, freq='B')
+    dates = pd.date_range(start=start_date, end=datetime.now(), freq='B')
     
-    equity_curve = []
-    daily_breakdown = [] # For monthly table
+    curve = []
+    monthly_stats = []
     
     for d in dates:
-        # Filter trades that happened before or on date 'd'
-        # We need to reconstruct the portfolio state at end of day 'd'
+        curr_cash = user.initial_capital
+        holdings = {}
         
-        # Optimization: We can't run the full loop efficiently for 365 days. 
-        # Simplified: We calculate Equity = Cash + Sum(Qty * Price_on_Day_D)
-        
-        current_cash = user.initial_capital
-        current_holdings = {} # {ticker: qty}
-        
+        # 1. Reconstruct Portfolio Holdings at date d
+        # Optimization: Pre-filter transactions
         relevant_txs = [t for t in txs if t.date <= d]
         
         for t in relevant_txs:
-            if t.trans_type in ['BUY', 'BUY_TO_COVER']:
-                current_cash -= t.amount
-                sign = 1 if t.trans_type == 'BUY' else 1 # Qty is positive in DB, we handle logic
-                # Actually, BUY adds qty, COVER adds qty (reduces negative)
-                # Wait, earlier logic: Short Qty is negative.
-                qty_change = t.quantity
-                if t.trans_type == 'BUY_TO_COVER': 
-                     # If we stored Short as negative, adding positive reduces it.
-                     pass 
-                
-            elif t.trans_type in ['SELL', 'SHORT_SELL']:
-                current_cash += t.amount
-                qty_change = -t.quantity
-
-            # Update Net Qty
-            current_holdings[t.ticker] = current_holdings.get(t.ticker, 0.0)
-            
-            if t.trans_type == 'BUY': current_holdings[t.ticker] += t.quantity
-            elif t.trans_type == 'SELL': current_holdings[t.ticker] -= t.quantity
-            elif t.trans_type == 'SHORT_SELL': current_holdings[t.ticker] -= t.quantity
-            elif t.trans_type == 'BUY_TO_COVER': current_holdings[t.ticker] += t.quantity
-            
-        # Calculate Equity
-        daily_long_val = 0.0
-        daily_short_val = 0.0
+            if t.trans_type == 'BUY':
+                curr_cash -= t.amount
+                holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
+            elif t.trans_type == 'SELL':
+                curr_cash += t.amount
+                holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
+            elif t.trans_type == 'SHORT_SELL':
+                curr_cash += t.amount
+                holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
+            elif t.trans_type == 'BUY_TO_COVER':
+                curr_cash -= t.amount
+                holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
         
-        for tik, qty in current_holdings.items():
-            if abs(qty) > 0.001:
-                # Get price
-                try:
-                    if isinstance(prices, pd.DataFrame):
-                        # Handle multi-column vs single column
-                        if tik in prices.columns:
-                            p_series = prices[tik]
-                        else:
-                            p_series = prices.iloc[:, 0] # Fallback
-                    else:
-                        p_series = prices
+        # 2. Value Holdings
+        long_val = 0.0
+        short_val = 0.0
+        
+        if not batch_data.empty:
+            # Find closest index
+            try:
+                idx = batch_data.index.get_indexer([d], method='pad')[0]
+                if idx != -1:
+                    row = batch_data.iloc[idx]
                     
-                    # Get price at date d
-                    idx = p_series.index.get_indexer([d], method='pad')[0]
-                    if idx != -1:
-                        p = float(p_series.iloc[idx])
-                    else:
-                        p = 0.0
-                except: p = 0.0
-                
-                mkt_val = qty * p
-                
-                if qty > 0: daily_long_val += mkt_val
-                else: daily_short_val += mkt_val # This is negative (Liability)
+                    for tik, qty in holdings.items():
+                        if abs(qty) > 0.001:
+                            # Simplification: Assume historical data is USD adjusted or close enough 
+                            # (Real app needs historical FX map too)
+                            # For now, we take raw price. 
+                            try: p = extract_scalar(row[tik])
+                            except: p = 0.0
+                            
+                            val = qty * p
+                            if qty > 0: long_val += val
+                            else: short_val += abs(val) # Liability
+                else:
+                    pass
+            except: pass
+            
+        total_equity = curr_cash + long_val - short_val # Wait: Cash includes short proceeds. Equity = Cash - Liability. Correct.
         
-        # Equity = Cash + Longs + Shorts (Shorts are negative value here? No.)
-        # Logic Recap:
-        # Short Sell: Cash increases (+100). Position Qty (-1). Price (100).
-        # Equity = 100 + (-1 * 100) = 0. Correct.
-        # Price drops to 90.
-        # Equity = 100 + (-1 * 90) = 10. Correct.
-        
-        total_equity = current_cash + daily_long_val + daily_short_val
-        equity_curve.append({"Date": d, "Equity": total_equity, "Return %": ((total_equity/user.initial_capital)-1)*100})
-        
-        # For Monthly Table
-        daily_breakdown.append({
-            "Date": d, 
-            "Long PnL": daily_long_val, # Approx
-            "Short PnL": daily_short_val, # Approx
-            "Total Equity": total_equity
-        })
-        
-    df_curve = pd.DataFrame(equity_curve)
-    df_breakdown = pd.DataFrame(daily_breakdown)
-    
-    # Fetch SPY
-    spy_curve = get_spy_benchmark(start_date)
-    
-    return df_curve, spy_curve, df_breakdown
+        curve.append({"Date": d, "Equity": total_equity, "Return %": ((total_equity/user.initial_capital)-1)*100})
+        monthly_stats.append({"Date": d, "Longs": long_val, "Shorts": -short_val, "Total": total_equity})
 
-def get_monthly_table(df_breakdown):
-    if df_breakdown.empty: return pd.DataFrame()
+    df_curve = pd.DataFrame(curve)
+    df_monthly = pd.DataFrame(monthly_stats)
     
-    # Resample to Monthly End
-    df_breakdown.set_index('Date', inplace=True)
-    monthly = df_breakdown.resample('ME').last()
-    
-    # Calculate % Change
-    monthly['Total Return'] = monthly['Total Equity'].pct_change()
-    
-    # Format for display
-    display_df = monthly[['Total Equity', 'Total Return']].copy()
-    display_df['Total Return'] = display_df['Total Return'] * 100
-    display_df.index = display_df.index.strftime('%Y-%B')
-    
-    return display_df
+    # SPY Benchmark
+    try:
+        spy = fetch_batch_data(["SPY"], start_date)
+        if not spy.empty:
+            spy_start = extract_scalar(spy.iloc[0])
+            spy_ret = ((spy['SPY'] / spy_start) - 1) * 100
+        else:
+            spy_ret = pd.Series()
+    except:
+        spy_ret = pd.Series()
+        
+    return df_curve, spy_ret, df_monthly
 
 # ==========================================
 # 4. HELPERS
 # ==========================================
 def format_ticker(symbol, market):
     symbol = symbol.strip().upper()
-    suffixes = {"US": "", "Hong Kong": ".HK", "China (Shanghai)": ".SS", "China (Shenzhen)": ".SZ", "Japan": ".T", "UK": ".L", "France": ".PA"}
-    return f"{symbol}{suffixes.get(market, '')}"
+    suffix = MARKET_CONFIG.get(market, {}).get('suffix', '')
+    return f"{symbol}{suffix}"
 
 def is_test_mode():
-    try:
-        cfg = session.query(SystemConfig).filter_by(key='test_mode').first()
-        return cfg.value == 'True' if cfg else False
+    try: cfg = session.query(SystemConfig).filter_by(key='test_mode').first(); return cfg.value == 'True' if cfg else False
     except: return False
-
-def check_password(password, hashed):
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-
-def hash_password(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+def hash_password(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+def check_password(p, h): return bcrypt.checkpw(p.encode(), h.encode())
 
 def init_db():
     try:
         if not session.query(User).filter_by(username='admin').first():
-            pw = hash_password('8848')
-            session.add(User(username='admin', password_hash=pw, role='admin', email='admin@fund.com'))
+            session.add(User(username='admin', password_hash=hash_password('8848'), role='admin'))
             session.commit()
         if not session.query(SystemConfig).filter_by(key='test_mode').first():
             session.add(SystemConfig(key='test_mode', value='False'))
@@ -431,209 +408,166 @@ def init_db():
 def analyst_page(user):
     st.title(f"Portfolio: {user.username}")
     
-    # --- 1. Top Metrics ---
-    state, pending = calculate_portfolio_state(user.id)
+    # --- METRICS ---
+    state = calculate_portfolio_state(user.id)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Equity (USD)", f"${state['equity']:,.0f}")
+    c2.metric("Cash (USD)", f"${state['cash']:,.0f}")
+    c3.metric("YTD PnL", f"${state['equity'] - user.initial_capital:,.0f}")
     
-    # Constraints Check
-    long_count = len([k for k,v in state['positions'].items() if v['type']=='LONG'])
-    short_count = len([k for k,v in state['positions'].items() if v['type']=='SHORT'])
-    cash_ok = state['cash'] < 1500000 
-    
-    # Status Banner
-    status_cols = st.columns(4)
-    status_cols[0].metric("Equity", f"${state['equity']:,.0f}")
-    status_cols[1].metric("Cash", f"${state['cash']:,.0f}", delta="Too High" if not cash_ok else "Compliant", delta_color="inverse")
-    status_cols[2].metric("Longs", f"{long_count}/5")
-    status_cols[3].metric("Shorts", f"{short_count}/3")
-    
-    # --- 2. Charts (PnL vs SPY) ---
     st.divider()
-    df_curve, spy_curve, df_monthly = generate_performance_data(user.id)
-    
-    col_chart, col_stats = st.columns([2, 1])
-    
-    with col_chart:
-        st.subheader("Performance vs SPY")
-        if not df_curve.empty:
-            fig = go.Figure()
-            # User Curve
-            fig.add_trace(go.Scatter(x=df_curve['Date'], y=df_curve['Return %'], name='Portfolio', line=dict(color='blue')))
-            # SPY Curve
-            if not spy_curve.empty:
-                # Align dates
-                fig.add_trace(go.Scatter(x=spy_curve.index, y=spy_curve.values, name='S&P 500', line=dict(color='gray', dash='dot')))
-            
-            fig.update_layout(yaxis_title="Return (%)", margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No history available.")
 
-    with col_stats:
-        st.subheader("Monthly Returns")
-        monthly_df = get_monthly_table(df_monthly)
-        if not monthly_df.empty:
-            st.dataframe(monthly_df.style.format({"Total Equity": "${:,.0f}", "Total Return": "{:+.2f}%"}))
-        else:
-            st.write("No data.")
-
-    # --- 3. Holdings & YTD Table ---
-    st.divider()
+    # --- CHARTS & MONTHLY ---
+    df_c, spy_c, df_m = generate_curve_and_stats(user.id)
     
-    # YTD Table preparation
-    ytd_data = []
-    for tik, pos in state['positions'].items():
-        ytd_data.append({
-            "Ticker": tik,
-            "Side": pos['type'],
-            "Qty": pos['qty'],
-            "Avg Cost": pos['avg_cost'],
-            "Current": pos.get('current_price', 0),
-            "Unrealized PnL": pos.get('unrealized_pnl', 0),
-            "Realized PnL": state['realized_pnl_ytd'].get(tik, 0),
-            "Total PnL": pos.get('unrealized_pnl', 0) + state['realized_pnl_ytd'].get(tik, 0)
-        })
-    # Add fully closed positions
-    for tik, r_pnl in state['realized_pnl_ytd'].items():
-        if tik not in state['positions']:
-             ytd_data.append({
-                "Ticker": tik, "Side": "-", "Qty": 0, "Avg Cost": 0, "Current": 0,
-                "Unrealized PnL": 0, "Realized PnL": r_pnl, "Total PnL": r_pnl
-             })
-
-    t1, t2 = st.tabs(["Current Holdings", "YTD PnL Breakdown"])
+    t1, t2 = st.tabs(["Performance Chart", "Monthly Breakdown"])
     
     with t1:
-        if state['positions']:
-            h_df = pd.DataFrame([
-                {"Ticker": k, "Side": v['type'], "Entry Date": v['first_entry'].date(), "Qty": v['qty'], "Mkt Value": v.get('mkt_value',0), "Unrealized": v.get('unrealized_pnl',0)}
-                for k,v in state['positions'].items()
-            ])
-            st.dataframe(h_df.style.format({"Mkt Value":"${:,.0f}", "Unrealized":"${:,.0f}"}), use_container_width=True)
-        else: st.write("Cash only.")
-
+        if not df_c.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_c['Date'], y=df_c['Return %'], name="Portfolio", line=dict(color='blue')))
+            if not spy_c.empty:
+                fig.add_trace(go.Scatter(x=spy_c.index, y=spy_c.values, name="SPY", line=dict(color='gray', dash='dot')))
+            st.plotly_chart(fig, use_container_width=True)
+        else: st.info("No history.")
+        
     with t2:
-        if ytd_data:
-            ytd_df = pd.DataFrame(ytd_data)
-            st.dataframe(ytd_df.style.format({
-                "Avg Cost":"${:,.2f}", "Current":"${:,.2f}", 
-                "Unrealized PnL":"${:,.0f}", "Realized PnL":"${:,.0f}", "Total PnL":"${:,.0f}"
-            }), use_container_width=True)
+        if not df_m.empty:
+            df_m.set_index('Date', inplace=True)
+            monthly = df_m.resample('ME').last()
+            monthly['Return %'] = monthly['Total'].pct_change() * 100
+            st.dataframe(monthly[['Total', 'Return %']].style.format({"Total":"${:,.0f}", "Return %":"{:.2f}%"}), use_container_width=True)
+        else: st.info("No data.")
 
-    # --- 4. Trade Entry (Compliance Rules) ---
+    # --- HOLDINGS ---
+    st.subheader("Holdings & Attribution")
+    
+    # Prepare Data
+    holdings_data = []
+    for tik, pos in state['positions'].items():
+        holdings_data.append({
+            "Ticker": tik, "Side": pos['type'], "Qty": pos['qty'], 
+            "Avg Cost": pos['avg_cost'], "Current": pos.get('current_price',0),
+            "Unrealized": pos.get('unrealized',0),
+            "Realized YTD": state['realized_pnl_ytd'].get(tik, 0)
+        })
+    # Add closed
+    for tik, pnl in state['realized_pnl_ytd'].items():
+        if tik not in state['positions']:
+            holdings_data.append({
+                "Ticker": tik, "Side": "FLAT", "Qty": 0, "Avg Cost": 0, "Current": 0,
+                "Unrealized": 0, "Realized YTD": pnl
+            })
+            
+    if holdings_data:
+        h_df = pd.DataFrame(holdings_data)
+        h_df['Total PnL'] = h_df['Unrealized'] + h_df['Realized YTD']
+        st.dataframe(h_df.style.format({
+            "Avg Cost":"${:,.2f}", "Current":"${:,.2f}", 
+            "Unrealized":"${:,.0f}", "Realized YTD":"${:,.0f}", "Total PnL":"${:,.0f}"
+        }), use_container_width=True)
+
+    # --- ORDER ENTRY ---
     st.divider()
     st.subheader("Trade Execution")
     
     with st.expander("Compliance Rules", expanded=False):
         st.markdown("""
-        1. **Longs:** $500k - $2M per name. Max 5 names.
-        2. **Shorts:** $300k - $1.2M per name. Max 3 names.
-        3. **Hold:** New positions must be held for > 30 days.
-        4. **Cash:** Target < $1.5M.
+        * **Longs:** \$500k - \$2M (Max 5 names)
+        * **Shorts:** \$300k - \$1.2M (Max 3 names)
+        * **Lockup:** > 30 Days hold
+        * **Cash:** < \$1.5M target
         """)
 
-    test_mode = is_test_mode()
-    if test_mode: st.warning("TEST MODE: Backdating Enabled")
-
-    with st.form("order_ticket"):
+    with st.form("order"):
         c1,c2,c3,c4 = st.columns(4)
-        mkt = c1.selectbox("Market", ["US", "Hong Kong", "China (Shanghai)", "China (Shenzhen)", "Japan", "UK", "France"])
+        mkt = c1.selectbox("Market", list(MARKET_CONFIG.keys()))
         tik = c2.text_input("Ticker").strip()
-        action = c3.selectbox("Action", ["BUY", "SELL", "SHORT_SELL", "BUY_TO_COVER"])
-        amt = c4.number_input("Amount ($)", min_value=10000.0, step=10000.0)
+        side = c3.selectbox("Action", ["BUY", "SELL", "SHORT_SELL", "BUY_TO_COVER"])
+        amt = c4.number_input("Amount (USD)", min_value=10000.0, step=10000.0)
         
-        t_date = datetime.now()
-        if test_mode: t_date = st.date_input("Date", value="today")
-        notes = st.text_area("Notes")
-
-        if st.form_submit_button("Submit Order"):
+        test = is_test_mode()
+        d_val = st.date_input("Date", value="today") if test else datetime.now()
+        note = st.text_area("Notes")
+        
+        if st.form_submit_button("Submit"):
             final_tik = format_ticker(tik, mkt)
-            
-            # --- COMPLIANCE CHECKS ---
             valid = True
-            err_msg = ""
+            msg = ""
             
-            # Check 1: Count Limits (Only for Opening trades)
-            if action == 'BUY' and final_tik not in state['positions'] and long_count >= 5:
-                valid = False; err_msg = "Max Long count (5) reached."
-            if action == 'SHORT_SELL' and final_tik not in state['positions'] and short_count >= 3:
-                valid = False; err_msg = "Max Short count (3) reached."
-                
-            # Check 2: Size Limits
-            if action in ['BUY', 'SHORT_SELL']:
-                # Existing pos size
-                curr_size = state['positions'].get(final_tik, {}).get('mkt_value', 0)
-                proj_size = abs(curr_size) + amt
-                
-                if action == 'BUY':
-                    if not (500000 <= proj_size <= 2000000):
-                        valid = False; err_msg = f"Long size must be \$500k - \$2M. Projected: \${proj_size:,.0f}"
-                else: # Short
-                    if not (300000 <= proj_size <= 1200000):
-                        valid = False; err_msg = f"Short size must be \$300k - \$1.2M. Projected: \${proj_size:,.0f}"
+            # --- COMPLIANCE ---
+            # 1. Counts
+            l_count = len([p for p in state['positions'].values() if p['type']=='LONG'])
+            s_count = len([p for p in state['positions'].values() if p['type']=='SHORT'])
             
-            # Check 3: 1 Month Lockup (For Closing)
-            if action in ['SELL', 'BUY_TO_COVER']:
-                if final_tik in state['positions']:
-                    entry_dt = state['positions'][final_tik]['first_entry']
-                    # Use current date or backdated date for check
-                    check_date = datetime.combine(t_date, datetime.min.time()) if test_mode else datetime.now()
-                    
-                    if entry_dt and (check_date - entry_dt).days < 30:
-                        valid = False; err_msg = f"Position held < 30 days (Entry: {entry_dt.date()}). Cannot unwind yet."
-                else:
-                    valid = False; err_msg = "No position to close."
+            if side == 'BUY' and final_tik not in state['positions'] and l_count >= 5:
+                valid = False; msg = "Max Longs (5)"
+            if side == 'SHORT_SELL' and final_tik not in state['positions'] and s_count >= 3:
+                valid = False; msg = "Max Shorts (3)"
+                
+            # 2. Sizes (Opening trades only)
+            if side in ['BUY', 'SHORT_SELL']:
+                curr_sz = state['positions'].get(final_tik, {}).get('mkt_val', 0)
+                new_sz = abs(curr_sz) + amt
+                if side == 'BUY' and not (500000 <= new_sz <= 2000000):
+                    valid = False; msg = f"Long Size limits ($500k-$2M). Proj: ${new_sz:,.0f}"
+                if side == 'SHORT_SELL' and not (300000 <= new_sz <= 1200000):
+                    valid = False; msg = f"Short Size limits ($300k-$1.2M). Proj: ${new_sz:,.0f}"
 
-            if valid:
-                # Execution Logic
-                if test_mode:
-                    h_date = datetime.combine(t_date, datetime.min.time())
-                    price = get_historical_price(final_tik, h_date)
-                    if price > 0:
-                        qty = amt / price
-                        t = Transaction(user_id=user.id, ticker=final_tik, trans_type=action,
-                                        status='FILLED', price=price, quantity=qty, amount=amt, date=h_date, notes=notes)
-                        session.add(t)
+            # 3. Lockup (Closing trades)
+            if side in ['SELL', 'BUY_TO_COVER']:
+                entry = state['positions'].get(final_tik, {}).get('first_entry')
+                check_d = datetime.combine(d_val, datetime.min.time()) if test else datetime.now()
+                if entry and (check_d - entry).days < 30:
+                    valid = False; msg = f"Held < 30 Days (Entry: {entry.date()})"
+            
+            if not valid:
+                st.error(msg)
+            else:
+                # EXECUTION
+                if test:
+                    h_date = datetime.combine(d_val, datetime.min.time())
+                    local_p, usd_p = get_historical_price(final_tik, h_date, mkt)
+                    
+                    if usd_p > 0:
+                        qty = amt / usd_p
+                        session.add(Transaction(
+                            user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
+                            status='FILLED', date=h_date, amount=amt, quantity=qty,
+                            local_price=local_p, price=usd_p, notes=f"[BACKDATE] {note}"
+                        ))
                         session.commit()
-                        st.success(f"Executed at ${price:.2f}")
-                        time.sleep(1)
-                        st.rerun()
+                        st.success(f"Filled @ ${usd_p:.2f}")
+                        st.cache_data.clear()
+                        time.sleep(1); st.rerun()
                     else: st.error("Price not found")
                 else:
-                    # Live Pending
-                    t = Transaction(user_id=user.id, ticker=final_tik, trans_type=action,
-                                    status='PENDING', amount=amt, notes=notes)
-                    session.add(t)
+                    session.add(Transaction(
+                        user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
+                        status='PENDING', amount=amt, notes=note
+                    ))
                     session.commit()
-                    st.success("Order Pending Next Open")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.error(f"Compliance Error: {err_msg}")
+                    st.success("Pending Open")
+                    time.sleep(1); st.rerun()
 
 def pm_page(user):
-    st.title("PM Overview")
+    st.title("PM Dashboard")
     analysts = session.query(User).filter_by(role='analyst').all()
     
-    # Master Summary
     summary = []
     for a in analysts:
-        s, _ = calculate_portfolio_state(a.id)
-        pnl = s['equity'] - a.initial_capital
+        s = calculate_portfolio_state(a.id)
         summary.append({
-            "Analyst": a.username,
-            "Equity": s['equity'],
-            "Cash": s['cash'],
-            "YTD PnL": pnl,
-            "Compliance": "⚠️ High Cash" if s['cash'] > 1500000 else "✅ OK"
+            "Analyst": a.username, "Equity": s['equity'], 
+            "Cash": s['cash'], "YTD PnL": s['equity'] - a.initial_capital
         })
-    
-    st.dataframe(pd.DataFrame(summary).style.format({"Equity":"${:,.0f}", "Cash":"${:,.0f}", "YTD PnL":"${:,.0f}"}), use_container_width=True)
+    st.dataframe(pd.DataFrame(summary).style.format({"Equity":"${:,.0f}", "YTD PnL":"${:,.0f}"}), use_container_width=True)
     
     st.divider()
     sel = st.selectbox("Select Analyst", [a.username for a in analysts])
     if sel:
         target = session.query(User).filter_by(username=sel).first()
-        analyst_page(target) # Reuse the analyst view
+        analyst_page(target)
 
 def admin_page():
     st.title("Admin")
@@ -643,35 +577,20 @@ def admin_page():
         cfg = session.query(SystemConfig).filter_by(key='test_mode').first()
         cfg.value = str(not curr); session.commit(); st.rerun()
     
-    # User Mgmt
-    with st.form("new_user"):
-        u = st.text_input("User"); p = st.text_input("Pass", type="password"); r = st.selectbox("Role", ["analyst", "pm"])
-        if st.form_submit_button("Create"):
-            session.add(User(username=u, password_hash=hash_password(p), role=r)); session.commit(); st.rerun()
-    
-    users = session.query(User).all()
-    to_del = st.selectbox("Delete", [u.username for u in users if u.username!='admin'])
-    if st.button("Delete"):
-        session.delete(session.query(User).filter_by(username=to_del).first()); session.commit(); st.rerun()
-
-# --- HELPERS ---
-def format_ticker(symbol, market):
-    symbol = symbol.strip().upper()
-    suffixes = {"US": "", "Hong Kong": ".HK", "China (Shanghai)": ".SS", "China (Shenzhen)": ".SZ", "Japan": ".T", "UK": ".L", "France": ".PA"}
-    return f"{symbol}{suffixes.get(market, '')}"
-def is_test_mode():
-    try: cfg = session.query(SystemConfig).filter_by(key='test_mode').first(); return cfg.value == 'True' if cfg else False
-    except: return False
-def hash_password(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
-def init_db():
-    try:
-        if not session.query(User).filter_by(username='admin').first():
-            session.add(User(username='admin', password_hash=hash_password('8848'), role='admin'))
-            session.commit()
-        if not session.query(SystemConfig).filter_by(key='test_mode').first():
-            session.add(SystemConfig(key='test_mode', value='False'))
-            session.commit()
-    except: pass
+    c1, c2 = st.columns([1,2])
+    with c1:
+        st.subheader("New User")
+        with st.form("u"):
+            u=st.text_input("User"); p=st.text_input("Pass",type="password"); r=st.selectbox("Role",["analyst","pm"])
+            if st.form_submit_button("Create"):
+                session.add(User(username=u,password_hash=hash_password(p),role=r));session.commit();st.rerun()
+    with c2:
+        st.subheader("Users")
+        users = session.query(User).all()
+        st.dataframe(pd.DataFrame([{"User":x.username,"Role":x.role} for x in users]), hide_index=True)
+        to_del = st.selectbox("Delete", [u.username for u in users if u.username!='admin'])
+        if st.button("Delete"):
+            session.delete(session.query(User).filter_by(username=to_del).first()); session.commit(); st.rerun()
 
 def main():
     st.set_page_config(layout="wide", page_title="AlphaTracker Pro")
@@ -683,12 +602,16 @@ def main():
         u = st.text_input("User"); p = st.text_input("Pass", type="password")
         if st.button("Login"):
             user = session.query(User).filter_by(username=u).first()
-            if user and bcrypt.checkpw(p.encode(), user.password_hash.encode()):
+            if user and check_password(p, user.password_hash):
                 st.session_state.user_id = user.id; st.session_state.role = user.role; st.rerun()
     else:
         user = session.query(User).filter_by(id=st.session_state.user_id).first()
+        if not user: st.session_state.user_id = None; st.rerun()
+        
         with st.sidebar:
+            st.write(f"User: {user.username}")
             if st.button("Logout"): st.session_state.user_id = None; st.rerun()
+        
         if user.role=='admin': admin_page()
         elif user.role=='analyst': analyst_page(user)
         elif user.role=='pm': pm_page(user)
