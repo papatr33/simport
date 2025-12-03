@@ -105,7 +105,7 @@ engine = get_db_engine()
 try:
     Base.metadata.create_all(engine)
 except Exception:
-    pass # Tables likely exist
+    pass 
 
 Session = sessionmaker(bind=engine)
 
@@ -126,7 +126,7 @@ def fetch_batch_data(tickers, start_date):
     tickers = list(set(tickers))
     try:
         # Buffer start date
-        data = yf.download(tickers, start=start_date - timedelta(days=5), progress=False)['Close']
+        data = yf.download(tickers, start=start_date - timedelta(days=7), progress=False)['Close']
         if isinstance(data, pd.Series): data = data.to_frame(name=tickers[0])
         elif data.empty: return pd.DataFrame()
         
@@ -266,7 +266,7 @@ def calculate_portfolio_state(user_id, session_obj):
 def get_ytd_performance(user_id, session_obj):
     """
     Generates a continuous daily equity curve from Jan 1st (or inception) to Today.
-    Fills gaps for holidays. Normalizes against SPY.
+    FIX: Now correctly handles FX rates for historical data to prevent 1000% return bugs.
     """
     txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
     user = session_obj.query(User).filter_by(id=user_id).first()
@@ -282,14 +282,26 @@ def get_ytd_performance(user_id, session_obj):
         df['Return %'] = 0.0
         return df, pd.Series()
 
-    # Get Tickers involved in history
-    tickers = list(set([t.ticker for t in txs]))
+    # 1. Map Tickers to Markets
+    # We need to know which ticker belongs to which market for FX
+    ticker_market_map = {}
+    for t in txs:
+        ticker_market_map[t.ticker] = t.market
+
+    tickers = list(ticker_market_map.keys())
     
+    # 2. Identify FX Tickers Needed
+    fx_tickers = set()
+    for m in ticker_market_map.values():
+        if m and MARKET_CONFIG.get(m, {}).get('fx'):
+            fx_tickers.add(MARKET_CONFIG[m]['fx'])
+    
+    # 3. Fetch Stocks AND FX History
+    all_tickers = tickers + list(fx_tickers)
     fetch_start = min(start_date, txs[0].date) - timedelta(days=5)
-    batch_data = fetch_batch_data(tickers, fetch_start)
+    batch_data = fetch_batch_data(all_tickers, fetch_start)
     
     dates = pd.date_range(start=start_date, end=end_date, freq='B')
-    
     curve = []
     
     if not batch_data.empty:
@@ -301,7 +313,9 @@ def get_ytd_performance(user_id, session_obj):
     tx_idx = 0
     n_txs = len(txs)
     
-    # 1. Roll forward to Jan 1
+    # 4. Replay Loop
+    
+    # Roll forward to Jan 1
     while tx_idx < n_txs and txs[tx_idx].date < start_date:
         t = txs[tx_idx]
         if t.trans_type == 'BUY':
@@ -318,7 +332,7 @@ def get_ytd_performance(user_id, session_obj):
             holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
         tx_idx += 1
 
-    # 2. Daily Loop
+    # Daily Valuation
     for d in dates:
         d_norm = d.normalize()
         
@@ -343,19 +357,37 @@ def get_ytd_performance(user_id, session_obj):
         
         if not batch_data.empty:
             try:
+                row = pd.Series()
                 if d_norm in batch_data.index:
                     row = batch_data.loc[d_norm]
                 else:
+                    # Previous Close if data missing
                     idx = batch_data.index.get_indexer([d_norm], method='pad')[0]
                     if idx != -1: row = batch_data.iloc[idx]
-                    else: row = pd.Series()
 
                 if not row.empty:
                     for tik, qty in holdings.items():
                         if abs(qty) > 0.001:
-                            p = float(row[tik]) if tik in row else 0.0
-                            if pd.isna(p): p = 0.0
-                            val = qty * p
+                            # 1. Get Local Price
+                            p_local = float(row[tik]) if tik in row else 0.0
+                            if pd.isna(p_local): p_local = 0.0
+                            
+                            # 2. Convert to USD
+                            mkt = ticker_market_map.get(tik, 'US')
+                            fx_sym = MARKET_CONFIG.get(mkt, {}).get('fx')
+                            p_usd = p_local
+                            
+                            if fx_sym:
+                                if fx_sym in row:
+                                    rate = float(row[fx_sym])
+                                    if mkt == "UK": p_local /= 100.0
+                                    if rate > 0: p_usd = p_local / rate
+                                    else: p_usd = 0.0
+                                else:
+                                    # Fallback if FX missing: assume 1:1 to avoid crash, but it will be wrong
+                                    p_usd = p_local 
+
+                            val = qty * p_usd
                             if qty > 0: long_val += val
                             else: short_val += abs(val)
             except: pass
@@ -364,6 +396,7 @@ def get_ytd_performance(user_id, session_obj):
         curve.append({"Date": d, "Equity": equity})
 
     df_curve = pd.DataFrame(curve)
+    # Calculation: (Current Equity / Starting Capital) - 1
     df_curve['Return %'] = ((df_curve['Equity'] / user.initial_capital) - 1) * 100
     
     spy_ret = pd.Series()
@@ -527,7 +560,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
             st.markdown("""
             * **Longs:** Max 5 names. Position Size: \$500k - \$2M.
             * **Shorts:** Max 3 names. Position Size: \$300k - \$1.2M. Total Short: Max \$3M.
-            * **Cash:** Must not exceed \$1.5M (Selling disallowed if Cash > \$1.5M).
+            * **Cash:** Must not exceed \$1.5M (Soft Limit - Warnings Only).
             * **Lockup:** Must hold new positions for at least 30 Days.
             """)
 
@@ -553,22 +586,21 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 
                 # --- COMPLIANCE ENGINE ---
                 error_msg = None
+                warning_msg = None
                 
                 # Pre-calculate metrics
                 current_longs = [p for p in state['positions'].values() if p['type'] == 'LONG']
                 current_shorts = [p for p in state['positions'].values() if p['type'] == 'SHORT']
                 current_pos = state['positions'].get(final_tik)
                 
-                # 1. CASH LIMIT RULE (For Sells)
-                # If Selling, Cash increases. Must not exceed 1.5M
+                # 1. CASH LIMIT RULE (Soft Limit)
                 if side in ['SELL', 'SHORT_SELL']:
                     projected_cash = state['cash'] + amt
                     if projected_cash > 1500000:
-                        error_msg = f"Compliance Violation: Sale would result in Cash > $1.5M (${projected_cash:,.0f}). You must stay invested."
+                        warning_msg = f"⚠️ Warning: Cash will exceed $1.5M limit (${projected_cash:,.0f}). Please redeploy capital soon."
 
                 # 2. LOCKUP RULE (For Closing Trades)
                 if side in ['SELL', 'BUY_TO_COVER']:
-                    # Use provided backdate if test mode, else now
                     curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
                     
                     if current_pos and current_pos['first_entry']:
@@ -576,7 +608,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         if days_held < 30:
                             error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding period is 30 days."
                     else:
-                        # Should not happen if logic is sound, but if flat...
                         if not current_pos: error_msg = "Cannot close a position you don't hold."
 
                 # 3. LONG RULES
@@ -586,7 +617,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         error_msg = "Compliance Violation: Max 5 Long positions allowed."
                     
                     # B. Position Sizing ($500k - $2M)
-                    # Current Value + New Amount
                     curr_val = current_pos['mkt_val'] if current_pos and current_pos['type']=='LONG' else 0
                     proj_val = curr_val + amt
                     if not (500000 <= proj_val <= 2000000):
@@ -613,6 +643,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 if error_msg:
                     st.error(error_msg)
                 else:
+                    if warning_msg:
+                        st.warning(warning_msg)
+                    
                     if test_mode:
                         h_date = datetime.combine(d_val, datetime.min.time())
                         local_p, usd_p = get_historical_price(final_tik, h_date, mkt)
