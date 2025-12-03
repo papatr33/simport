@@ -283,7 +283,9 @@ def calculate_portfolio_state(user_id, session_obj):
 def generate_curve_and_stats(user_id, session_obj):
     # Optimize: Only fetch required columns from DB
     txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
-    if not txs: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
+    # FIX: Return empty DataFrames if no history (Must return exactly 2 values)
+    if not txs: return pd.DataFrame(), pd.DataFrame()
     
     start_date = txs[0].date
     tickers = list(set([t.ticker for t in txs]))
@@ -298,7 +300,10 @@ def generate_curve_and_stats(user_id, session_obj):
     
     # Helper to map Ticker -> Index in batch_data for speed
     if not batch_data.empty:
-        batch_data.index = pd.to_datetime(batch_data.index).normalize()
+        # Ensure index is datetime and normalized
+        if not isinstance(batch_data.index, pd.DatetimeIndex):
+             batch_data.index = pd.to_datetime(batch_data.index)
+        batch_data.index = batch_data.index.normalize()
     
     # Running state
     curr_cash = user.initial_capital
@@ -332,19 +337,18 @@ def generate_curve_and_stats(user_id, session_obj):
         short_val = 0.0
         
         if not batch_data.empty and d_norm in batch_data.index:
-            row = batch_data.loc[d_norm]
-            for tik, qty in holdings.items():
-                if abs(qty) > 0.001:
-                    # Note: Using Raw Price here for curve speed. 
-                    # Real prod apps would need historical FX tables too.
-                    try: 
+            try:
+                row = batch_data.loc[d_norm]
+                for tik, qty in holdings.items():
+                    if abs(qty) > 0.001:
+                        # Use raw price for curve speed (simplification)
                         p = float(row[tik]) if tik in row else 0.0
                         if pd.isna(p): p = 0.0
-                    except: p = 0.0
-                    
-                    val = qty * p
-                    if qty > 0: long_val += val
-                    else: short_val += abs(val) # Liability
+                        
+                        val = qty * p
+                        if qty > 0: long_val += val
+                        else: short_val += abs(val) # Liability
+            except: pass
         
         total_equity = curr_cash + long_val - short_val
         curve.append({
@@ -352,7 +356,7 @@ def generate_curve_and_stats(user_id, session_obj):
             "Equity": total_equity, 
             "Return %": ((total_equity/user.initial_capital)-1)*100,
             "Longs": long_val,
-            "Shorts": -short_val # negative for visual chart
+            "Shorts": -short_val
         })
 
     df_curve = pd.DataFrame(curve)
