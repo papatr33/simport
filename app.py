@@ -951,7 +951,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         time.sleep(1); st.rerun()
 
 def pm_page(user, session_obj):
-    st.title("👨‍💼 Portfolio Manager Dashboard")
+    st.title("📖 Portfolio Manager Dashboard")
     
     analysts = session_obj.query(User).filter_by(role='analyst').all()
     if not analysts:
@@ -1160,3 +1160,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
