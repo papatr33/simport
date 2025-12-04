@@ -856,36 +856,43 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 sim_long_total = sum(p['mkt_val'] for p in sim_longs.values())
                 sim_short_total = sum(p['mkt_val'] for p in sim_shorts.values())
 
-                # 1. LONG RULES
-                if side == 'BUY':
+                # 1. LONG RULES (BUY or SELL/TRIM)
+                if side in ['BUY', 'SELL']:
                     if len(sim_longs) > 5:
                         error_msg = f"Compliance Violation: Max 5 Long positions allowed (Projected: {len(sim_longs)})."
                     
-                    # Check SIZE of THIS position
-                    this_val = sim_longs[final_tik]['mkt_val']
-                    pct = (this_val / sim_equity) * 100
-                    if not (10.0 <= pct <= 40.0):
-                        if pct > 40.0: error_msg = f"Violation: Position size {pct:.1f}% exceeds 40%."
-                        elif pct < 10.0: warning_msg = f"⚠️ Warning: Position size {pct:.1f}% below 10%."
+                    # Check SIZE of THIS position (if it still exists/wasn't closed)
+                    if final_tik in sim_longs:
+                        this_val = sim_longs[final_tik]['mkt_val']
+                        pct = (this_val / sim_equity) * 100
+                        if not (10.0 <= pct <= 40.0):
+                            if pct > 40.0: 
+                                error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% exceeds max limit (40%)."
+                            elif pct < 10.0: 
+                                error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% is below min limit (10%)."
                     
+                    # Total Long Exposure (Warning Only for now as ramping up takes time, or could be strict)
                     if (sim_long_total / sim_equity) < 0.90:
                          w = "Total Long Exposure below 90%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
-                # 2. SHORT RULES
-                if side == 'SHORT_SELL':
+                # 2. SHORT RULES (SHORT_SELL or COVER/TRIM)
+                if side in ['SHORT_SELL', 'BUY_TO_COVER']:
                     if len(sim_shorts) > 3:
                         error_msg = f"Compliance Violation: Max 3 Short positions allowed (Projected: {len(sim_shorts)})."
                     
-                    this_val = sim_shorts[final_tik]['mkt_val']
-                    pct = (this_val / sim_equity) * 100
-                    if not (10.0 <= pct <= 30.0):
-                         if pct > 30.0: error_msg = f"Violation: Short Position {pct:.1f}% exceeds 30%."
-                         elif pct < 10.0: warning_msg = f"⚠️ Warning: Short Position {pct:.1f}% below 10%."
+                    if final_tik in sim_shorts:
+                        this_val = sim_shorts[final_tik]['mkt_val']
+                        pct = (this_val / sim_equity) * 100
+                        if not (10.0 <= pct <= 30.0):
+                             if pct > 30.0: 
+                                 error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% exceeds max limit (30%)."
+                             elif pct < 10.0: 
+                                 error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% is below min limit (10%)."
                     
                     total_pct = (sim_short_total / sim_equity) * 100
                     if total_pct > 50.0:
-                        error_msg = f"Violation: Total Short Exposure {total_pct:.1f}% exceeds 50%."
+                        error_msg = f"Compliance Violation: Total Short Exposure {total_pct:.1f}% exceeds max limit (50%)."
                     elif total_pct < 30.0:
                          w = "Total Short Exposure below 30%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
