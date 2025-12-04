@@ -505,6 +505,15 @@ def analyst_page(user, session_obj, is_pm_view=False):
             else:
                 price_str = f"{loc_p:,.2f} {cur}"
 
+            # Return Calculation Corrected
+            # Short Return = PnL / Invested Capital (Abs Value)
+            # Long Return = PnL / Invested Capital
+            invested_capital = pos['qty'] * pos['avg_cost']
+            if invested_capital != 0:
+                ret_pct = (pnl / abs(invested_capital)) * 100
+            else:
+                ret_pct = 0.0
+
             holdings_data.append({
                 "Ticker": tik, "Type": pos['type'], "Market": pos['market'],
                 "Qty": f"{pos['qty']:,.0f}", 
@@ -512,7 +521,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 "Current Price (Local)": price_str,
                 "Market Val (USD)": pos.get('mkt_val', 0),
                 "Unrealized PnL": pnl,
-                "Return %": (pnl / (pos['qty']*pos['avg_cost']))*100 if pos['qty']!=0 else 0,
+                "Return %": ret_pct,
                 "Entry Date": pos.get('first_entry').strftime('%Y-%m-%d') if pos.get('first_entry') else '-'
             })
         
@@ -725,7 +734,10 @@ def pm_page(user, session_obj):
         df_c, _ = get_ytd_performance(a.id, session_obj)
         if not df_c.empty:
             m_df = df_c.set_index('Date').resample('ME').last()
-            m_df['Monthly Ret'] = m_df['Equity'].pct_change() * 100
+            
+            # Fix 1: Calculate Monthly Return based on PREVIOUS month end (or Initial Cap)
+            m_df['Prev Equity'] = m_df['Equity'].shift(1).fillna(a.initial_capital)
+            m_df['Monthly Ret'] = ((m_df['Equity'] / m_df['Prev Equity']) - 1) * 100
             
             m_ret = m_df['Monthly Ret'].fillna(0).to_dict() 
             formatted_ret = {k.strftime('%b'): v for k, v in m_ret.items() if k.year == datetime.now().year}
@@ -756,12 +768,6 @@ def pm_page(user, session_obj):
             existing_cols = [m for m in months if m in heatmap_df.columns]
             heatmap_df = heatmap_df[existing_cols]
             
-            # 4. CHANGED THEME TO 'BOUTIQUE'
-            # Using 'PuOr' (Purple-Orange) or 'RdBu' (Red-Blue) is more boutique than RdYlGn
-            # Let's use a custom divergent blue-gold if possible, or standard clean RdBu.
-            # Sticking to 'RdYlGn' but with symmetrical vmin/vmax for elegance is safer,
-            # but let's try 'BrBG' (Brown-BlueGreen) or 'PiYG' (Pink-Green) which are distinct.
-            # Let's go with 'RdYlGn' but softer range.
             st.dataframe(
                 heatmap_df.style.format("{:+.2f}%").background_gradient(cmap="RdYlGn", vmin=-10, vmax=10),
                 use_container_width=True
