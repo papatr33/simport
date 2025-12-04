@@ -483,6 +483,11 @@ def is_test_mode(session_obj):
         return cfg.value == 'True' if cfg else False
     except: return False
 
+def color_pnl(val):
+    """Styles negative values red and positive values green."""
+    color = '#10B981' if val > 0 else '#EF4444' if val < 0 else 'black'
+    return f'color: {color}'
+
 def render_chart(df_c, spy_c):
     if not df_c.empty:
         fig = go.Figure()
@@ -578,6 +583,21 @@ def analyst_page(user, session_obj, is_pm_view=False):
         net_exp = long_exp - short_exp
         c4.metric("Net Exposure", f"${net_exp:,.0f}")
 
+    # --- EXPOSURE WARNINGS ---
+    long_pct = (long_exp / state['equity']) * 100
+    short_pct = (short_exp / state['equity']) * 100
+    
+    warnings = []
+    if long_pct < 90.0:
+        warnings.append(f"⚠️ **Long Exposure Low:** Current {long_pct:.1f}% (Target > 90%)")
+    if short_pct < 30.0:
+        warnings.append(f"⚠️ **Short Exposure Low:** Current {short_pct:.1f}% (Target 30% - 50%)")
+        
+    if warnings:
+        with st.container():
+            for w in warnings:
+                st.warning(w)
+
     st.markdown("---")
 
     t1, t2, t3, t4, t5 = st.tabs(["Performance Chart", "Monthly Returns", "Current Holdings", "All Historical Positions", "Transaction Log"])
@@ -596,7 +616,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     "Long Ret %": "{:+.2f}%",
                     "Short Ret %": "{:+.2f}%",
                     "Total Ret %": "{:+.2f}%"
-                }).background_gradient(subset=["Total Ret %"], cmap="RdYlGn", vmin=-5, vmax=5),
+                }).map(color_pnl, subset=["Long Ret %", "Short Ret %", "Total Ret %"]),
                 use_container_width=True, hide_index=True
             )
         else:
@@ -651,7 +671,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     "Realized PnL": "{:+,.0f}",
                     "Return %": "{:+.2f}%",
                     "Port %": "{:.1f}%"
-                }).background_gradient(subset=["Return %"], cmap="RdYlGn", vmin=-20, vmax=20),
+                }).map(color_pnl, subset=["Return %"]),
                 use_container_width=True,
                 hide_index=True
             )
@@ -942,7 +962,7 @@ def pm_page(user, session_obj):
         df_sum.style.format({
             "Equity": "${:,.0f}", "YTD PnL": "{:+,.0f}", 
             "Cash %": "{:.1f}%", "Total Ret %": "{:+.2f}%"
-        }).background_gradient(subset=["Total Ret %"], cmap="RdYlGn", vmin=-10, vmax=10),
+        }).map(color_pnl, subset=["Total Ret %"]),
         use_container_width=True, hide_index=True
     )
 
@@ -958,7 +978,7 @@ def pm_page(user, session_obj):
                         "Long Ret %": "{:+.2f}%",
                         "Short Ret %": "{:+.2f}%",
                         "Total Ret %": "{:+.2f}%"
-                    }).background_gradient(subset=["Total Ret %"], cmap="RdYlGn", vmin=-5, vmax=5),
+                    }).map(color_pnl, subset=["Long Ret %", "Short Ret %", "Total Ret %"]),
                     use_container_width=True, hide_index=True
                 )
     else:
