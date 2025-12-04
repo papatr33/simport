@@ -17,7 +17,7 @@ import numpy as np
 
 st.set_page_config(
     layout="wide", 
-    page_title="AlphaTracker Pro",
+    page_title="SPS",
     page_icon="📈"
 )
 
@@ -1147,7 +1147,7 @@ def main():
                 st.session_state.user_id = None
                 st.rerun()
             st.markdown("---")
-            st.caption("AlphaTracker v2.0")
+            st.caption("SimPortfolioSystem v1.0")
 
         if user.role == 'admin':
             admin_page(session)
@@ -1160,4 +1160,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
