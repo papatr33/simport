@@ -110,7 +110,7 @@ except Exception:
 Session = sessionmaker(bind=engine)
 
 # ==========================================
-# 3. DATA ENGINE
+# 3. DATA ENGINE (OPTIMIZED)
 # ==========================================
 
 def extract_scalar(val):
@@ -120,7 +120,7 @@ def extract_scalar(val):
         return float(val)
     except: return 0.0
 
-@st.cache_data(ttl=300) 
+@st.cache_data(ttl=600) 
 def fetch_batch_data(tickers, start_date):
     if not tickers: return pd.DataFrame()
     tickers = list(set(tickers))
@@ -139,6 +139,7 @@ def fetch_batch_data(tickers, start_date):
     except: return pd.DataFrame()
 
 def get_historical_price(ticker, date_obj, market):
+    # This is only used for new order entry, no need to cache aggressively
     try:
         start = date_obj
         end = date_obj + timedelta(days=5)
@@ -160,88 +161,101 @@ def get_historical_price(ticker, date_obj, market):
         return local_p, usd_p
     except: return 0.0, 0.0
 
+# --- NEW HELPER: Fetch raw dicts to enable caching ---
+def fetch_user_transactions(user_id, session_obj):
+    txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
+    return [
+        {
+            'ticker': t.ticker,
+            'market': t.market,
+            'trans_type': t.trans_type,
+            'date': t.date,
+            'amount': t.amount,
+            'quantity': t.quantity,
+            'local_price': t.local_price,
+            'price': t.price
+        }
+        for t in txs
+    ]
+
 # ==========================================
-# 4. CORE LOGIC
+# 4. CORE LOGIC (CACHED)
 # ==========================================
 
-def calculate_portfolio_state(user_id, session_obj):
-    user = session_obj.query(User).filter_by(id=user_id).first()
-    txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
-    
+@st.cache_data(ttl=60, show_spinner=False)
+def calculate_portfolio_state_cached(txs_data, initial_capital):
     state = {
-        "cash": user.initial_capital,
+        "cash": initial_capital,
         "positions": {}, 
-        "realized_pnl_by_side": {}, # Key: (ticker, 'LONG'/'SHORT') -> amount
+        "realized_pnl_by_side": {}, 
         "equity": 0.0
     }
 
     # Ledger Replay
-    for t in txs:
-        tik = t.ticker
+    for t in txs_data:
+        tik = t['ticker']
         if tik not in state["positions"]:
             state["positions"][tik] = {
                 "qty": 0.0, 
                 "avg_cost": 0.0, 
-                "avg_cost_local": 0.0, # Added for local currency tracking
-                "type": "FLAT", "market": t.market, 
+                "avg_cost_local": 0.0,
+                "type": "FLAT", "market": t['market'], 
                 "first_entry": None
             }
         
         pos = state["positions"][tik]
         
-        if t.trans_type == "BUY":
-            state["cash"] -= t.amount
-            new_val = (pos["qty"] * pos["avg_cost"]) + t.amount
+        if t['trans_type'] == "BUY":
+            state["cash"] -= t['amount']
+            new_val = (pos["qty"] * pos["avg_cost"]) + t['amount']
             
-            # Local Cost Calculation
-            t_local_price = t.local_price if t.local_price else t.price
-            new_val_local = (pos["qty"] * pos["avg_cost_local"]) + (t.quantity * t_local_price)
+            t_local_price = t['local_price'] if t['local_price'] else t['price']
+            new_val_local = (pos["qty"] * pos["avg_cost_local"]) + (t['quantity'] * t_local_price)
             
-            pos["qty"] += t.quantity
+            pos["qty"] += t['quantity']
             pos["avg_cost"] = new_val / pos["qty"] if pos["qty"] > 0 else 0.0
             pos["avg_cost_local"] = new_val_local / pos["qty"] if pos["qty"] > 0 else 0.0
             
             pos["type"] = "LONG"
-            if not pos["first_entry"]: pos["first_entry"] = t.date
+            if not pos["first_entry"]: pos["first_entry"] = t['date']
 
-        elif t.trans_type == "SELL":
-            state["cash"] += t.amount
-            cost_basis = t.quantity * pos["avg_cost"]
-            pnl = t.amount - cost_basis
+        elif t['trans_type'] == "SELL":
+            state["cash"] += t['amount']
+            cost_basis = t['quantity'] * pos["avg_cost"]
+            pnl = t['amount'] - cost_basis
             
             key = (tik, 'LONG')
             state["realized_pnl_by_side"][key] = state["realized_pnl_by_side"].get(key, 0) + pnl
             
-            pos["qty"] -= t.quantity
+            pos["qty"] -= t['quantity']
             if pos["qty"] <= 0.001: 
                 del state["positions"][tik]
 
-        elif t.trans_type == "SHORT_SELL":
-            state["cash"] += t.amount
+        elif t['trans_type'] == "SHORT_SELL":
+            state["cash"] += t['amount']
             curr_val = abs(pos["qty"]) * pos["avg_cost"]
-            new_val = curr_val + t.amount
+            new_val = curr_val + t['amount']
 
-            # Local Cost Calculation
-            t_local_price = t.local_price if t.local_price else t.price
+            t_local_price = t['local_price'] if t['local_price'] else t['price']
             curr_val_local = abs(pos["qty"]) * pos["avg_cost_local"]
-            new_val_local = curr_val_local + (t.quantity * t_local_price)
+            new_val_local = curr_val_local + (t['quantity'] * t_local_price)
 
-            pos["qty"] -= t.quantity
+            pos["qty"] -= t['quantity']
             pos["avg_cost"] = new_val / abs(pos["qty"]) if abs(pos["qty"]) > 0 else 0.0
             pos["avg_cost_local"] = new_val_local / abs(pos["qty"]) if abs(pos["qty"]) > 0 else 0.0
             
             pos["type"] = "SHORT"
-            if not pos["first_entry"]: pos["first_entry"] = t.date
+            if not pos["first_entry"]: pos["first_entry"] = t['date']
 
-        elif t.trans_type == "BUY_TO_COVER":
-            state["cash"] -= t.amount
-            cost_basis = t.quantity * pos["avg_cost"]
-            pnl = cost_basis - t.amount
+        elif t['trans_type'] == "BUY_TO_COVER":
+            state["cash"] -= t['amount']
+            cost_basis = t['quantity'] * pos["avg_cost"]
+            pnl = cost_basis - t['amount']
             
             key = (tik, 'SHORT')
             state["realized_pnl_by_side"][key] = state["realized_pnl_by_side"].get(key, 0) + pnl
             
-            pos["qty"] += t.quantity
+            pos["qty"] += t['quantity']
             if abs(pos["qty"]) <= 0.001: 
                 del state["positions"][tik]
 
@@ -291,24 +305,21 @@ def calculate_portfolio_state(user_id, session_obj):
             
     return state
 
-def get_ytd_performance(user_id, session_obj):
-    txs = session_obj.query(Transaction).filter_by(user_id=user_id, status='FILLED').order_by(Transaction.date).all()
-    user = session_obj.query(User).filter_by(id=user_id).first()
-    
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ytd_performance_cached(txs_data, initial_capital):
     current_year = datetime.now().year
     start_date = datetime(current_year, 1, 1)
     end_date = datetime.now()
     
-    if not txs:
-        # Return empty structures if no trades
+    if not txs_data:
         dates = pd.date_range(start_date, end_date, freq='B')
-        df = pd.DataFrame({'Date': dates, 'Equity': user.initial_capital})
+        df = pd.DataFrame({'Date': dates, 'Equity': initial_capital})
         df['Return %'] = 0.0
-        return df, pd.Series(), pd.DataFrame()
+        return df, pd.Series()
 
     ticker_market_map = {}
-    for t in txs:
-        ticker_market_map[t.ticker] = t.market
+    for t in txs_data:
+        ticker_market_map[t['ticker']] = t['market']
 
     tickers = list(ticker_market_map.keys())
     
@@ -318,7 +329,11 @@ def get_ytd_performance(user_id, session_obj):
             fx_tickers.add(MARKET_CONFIG[m]['fx'])
     
     all_tickers = tickers + list(fx_tickers)
-    fetch_start = min(start_date, txs[0].date) - timedelta(days=5)
+    
+    # Safely find min date
+    first_tx_date = min(t['date'] for t in txs_data)
+    fetch_start = min(start_date, first_tx_date) - timedelta(days=5)
+    
     batch_data = fetch_batch_data(all_tickers, fetch_start)
     
     dates = pd.date_range(start=start_date, end=end_date, freq='B')
@@ -327,66 +342,58 @@ def get_ytd_performance(user_id, session_obj):
     if not batch_data.empty:
         batch_data.index = pd.to_datetime(batch_data.index).normalize()
     
-    curr_cash = user.initial_capital
+    curr_cash = initial_capital
     holdings = {} # {ticker: quantity}
     
-    # Track daily attribution
-    long_pnl_tracker = 0.0
-    short_pnl_tracker = 0.0
-
     tx_idx = 0
-    n_txs = len(txs)
+    n_txs = len(txs_data)
     
     # --- 1. PRE-ROLL (Before Start Date) ---
-    while tx_idx < n_txs and txs[tx_idx].date < start_date:
-        t = txs[tx_idx]
-        if t.trans_type == 'BUY':
-            curr_cash -= t.amount
-            holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
-        elif t.trans_type == 'SELL':
-            curr_cash += t.amount
-            holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
-        elif t.trans_type == 'SHORT_SELL':
-            curr_cash += t.amount
-            holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
-        elif t.trans_type == 'BUY_TO_COVER':
-            curr_cash -= t.amount
-            holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
+    while tx_idx < n_txs and txs_data[tx_idx]['date'] < start_date:
+        t = txs_data[tx_idx]
+        if t['trans_type'] == 'BUY':
+            curr_cash -= t['amount']
+            holdings[t['ticker']] = holdings.get(t['ticker'], 0) + t['quantity']
+        elif t['trans_type'] == 'SELL':
+            curr_cash += t['amount']
+            holdings[t['ticker']] = holdings.get(t['ticker'], 0) - t['quantity']
+        elif t['trans_type'] == 'SHORT_SELL':
+            curr_cash += t['amount']
+            holdings[t['ticker']] = holdings.get(t['ticker'], 0) - t['quantity']
+        elif t['trans_type'] == 'BUY_TO_COVER':
+            curr_cash -= t['amount']
+            holdings[t['ticker']] = holdings.get(t['ticker'], 0) + t['quantity']
         tx_idx += 1
 
     # --- 2. DAILY LOOP ---
     for d in dates:
         d_norm = d.normalize()
         
-        # Process transactions for this day
-        # We also need to track realized pnl for attribution here if we want perfect daily pnl breakdown
-        # For simplicity, we calculate daily change in Market Value + Flows to derive PnL
-        
         daily_long_flow = 0.0
         daily_short_flow = 0.0
         
-        while tx_idx < n_txs and txs[tx_idx].date.date() <= d_norm.date():
-            t = txs[tx_idx]
-            if t.trans_type == 'BUY':
-                curr_cash -= t.amount
-                holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
-                daily_long_flow += t.amount # Money went INTO longs
-            elif t.trans_type == 'SELL':
-                curr_cash += t.amount
-                holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
-                daily_long_flow -= t.amount # Money came OUT of longs
-            elif t.trans_type == 'SHORT_SELL':
-                curr_cash += t.amount
-                holdings[t.ticker] = holdings.get(t.ticker, 0) - t.quantity
-                daily_short_flow -= t.amount # Money came IN (liability increase, but cash inflow)
-            elif t.trans_type == 'BUY_TO_COVER':
-                curr_cash -= t.amount
-                holdings[t.ticker] = holdings.get(t.ticker, 0) + t.quantity
-                daily_short_flow += t.amount # Money went OUT (liability decrease)
+        while tx_idx < n_txs and txs_data[tx_idx]['date'].date() <= d_norm.date():
+            t = txs_data[tx_idx]
+            if t['trans_type'] == 'BUY':
+                curr_cash -= t['amount']
+                holdings[t['ticker']] = holdings.get(t['ticker'], 0) + t['quantity']
+                daily_long_flow += t['amount'] 
+            elif t['trans_type'] == 'SELL':
+                curr_cash += t['amount']
+                holdings[t['ticker']] = holdings.get(t['ticker'], 0) - t['quantity']
+                daily_long_flow -= t['amount']
+            elif t['trans_type'] == 'SHORT_SELL':
+                curr_cash += t['amount']
+                holdings[t['ticker']] = holdings.get(t['ticker'], 0) - t['quantity']
+                daily_short_flow -= t['amount']
+            elif t['trans_type'] == 'BUY_TO_COVER':
+                curr_cash -= t['amount']
+                holdings[t['ticker']] = holdings.get(t['ticker'], 0) + t['quantity']
+                daily_short_flow += t['amount']
             tx_idx += 1
             
         long_mv = 0.0
-        short_mv = 0.0 # Absolute value of short liability
+        short_mv = 0.0 
         
         if not batch_data.empty:
             try:
@@ -418,10 +425,9 @@ def get_ytd_performance(user_id, session_obj):
 
                             val = qty * p_usd
                             if qty > 0: long_mv += val
-                            else: short_mv += abs(val) # Liability is positive magnitude
+                            else: short_mv += abs(val) 
             except: pass
         
-        # Equity = Cash + Longs - ShortLiability
         equity = curr_cash + long_mv - short_mv
         
         curve.append({
@@ -435,25 +441,10 @@ def get_ytd_performance(user_id, session_obj):
 
     df_curve = pd.DataFrame(curve)
     
-    # Calculate Daily PnL Attribution
-    # PnL_Long = (LongMV_t - LongMV_t-1) - NetFlow_Long
-    # PnL_Short = (ShortMV_t-1 - ShortMV_t) - NetFlow_Short (Short logic is inverted: Liab decreases is profit)
-    # Note: ShortFlow is: ShortSell (+Cash), Cover (-Cash). 
-    # Logic: NewShortMV = OldShortMV + SellAmt - CoverAmt - PnL_Short
-    # => PnL_Short = OldShortMV - NewShortMV + SellAmt - CoverAmt
-    # => PnL_Short = OldShortMV - NewShortMV - DailyShortFlow (where flow is -Sell + Cover)
-    # Wait, in loop: ShortSell -> flow -= amount (negative), Cover -> flow += amount (positive)
-    # So Flow = Cover - Sell
-    # PnL_Short = (ShortMV_t-1 - ShortMV_t) - (Cover - Sell) 
-    #           = ShortMV_t-1 - ShortMV_t - Flow
-    
     df_curve['Long PnL'] = (df_curve['LongMV'].diff() - df_curve['LongFlow']).fillna(0)
     df_curve['Short PnL'] = (-(df_curve['ShortMV'].diff()) - df_curve['ShortFlow']).fillna(0)
     
-    # Correction for first day attribution (assuming 0 previous) if needed, 
-    # but strictly we care about returns in the window. 
-    
-    df_curve['Return %'] = ((df_curve['Equity'] / user.initial_capital) - 1) * 100
+    df_curve['Return %'] = ((df_curve['Equity'] / initial_capital) - 1) * 100
     
     spy_ret = pd.Series()
     try:
@@ -485,8 +476,10 @@ def is_test_mode(session_obj):
 
 def color_pnl(val):
     """Styles negative values red and positive values green."""
-    color = '#10B981' if val > 0 else '#EF4444' if val < 0 else 'black'
-    return f'color: {color}'
+    if isinstance(val, (int, float)):
+        color = '#10B981' if val > 0 else '#EF4444' if val < 0 else 'black'
+        return f'color: {color}'
+    return ''
 
 def render_chart(df_c, spy_c):
     if not df_c.empty:
@@ -534,14 +527,10 @@ def render_monthly_breakdown(df_curve, initial_capital):
     
     for month, group in grouped:
         month_end_equity = group['Equity'].iloc[-1]
-        
-        # Monthly Return = (End Equity - Start Equity) / Start Equity
-        # NOTE: Using previous month end equity as base
-        if prev_equity == 0: prev_equity = initial_capital # safety
+        if prev_equity == 0: prev_equity = initial_capital 
         
         total_ret = (month_end_equity - prev_equity) / prev_equity
         
-        # Contribution Calculation: Sum of Daily PnL / Start Equity
         long_pnl_sum = group['Long PnL'].sum()
         short_pnl_sum = group['Short PnL'].sum()
         
@@ -549,15 +538,21 @@ def render_monthly_breakdown(df_curve, initial_capital):
         short_contrib = short_pnl_sum / prev_equity
         
         monthly_stats.append({
-            "Month": month.strftime('%Y-%b'),
+            "Metric": month.strftime('%Y-%b'), # Will be transposed
             "Long Ret %": long_contrib * 100,
             "Short Ret %": short_contrib * 100,
             "Total Ret %": total_ret * 100
         })
         
         prev_equity = month_end_equity
+    
+    # Transpose logic
+    df = pd.DataFrame(monthly_stats)
+    if not df.empty:
+        df = df.set_index("Metric").T
+        return df
         
-    return pd.DataFrame(monthly_stats)
+    return pd.DataFrame()
 
 def analyst_page(user, session_obj, is_pm_view=False):
     if not is_pm_view:
@@ -565,7 +560,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
     else:
         st.markdown(f"### Viewing Analyst: {user.username}")
     
-    state = calculate_portfolio_state(user.id, session_obj)
+    txs_data = fetch_user_transactions(user.id, session_obj)
+    state = calculate_portfolio_state_cached(txs_data, user.initial_capital)
     
     # 1. Top Metrics
     with st.container():
@@ -602,7 +598,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     t1, t2, t3, t4, t5 = st.tabs(["Performance Chart", "Monthly Returns", "Current Holdings", "All Historical Positions", "Transaction Log"])
     
-    df_c, spy_c = get_ytd_performance(user.id, session_obj)
+    df_c, spy_c = get_ytd_performance_cached(txs_data, user.initial_capital)
 
     with t1:
         render_chart(df_c, spy_c)
@@ -611,13 +607,10 @@ def analyst_page(user, session_obj, is_pm_view=False):
         st.subheader("Monthly Return Attribution")
         m_df = render_monthly_breakdown(df_c, user.initial_capital)
         if not m_df.empty:
+            # Columns are now Months. Apply color map to all.
             st.dataframe(
-                m_df.style.format({
-                    "Long Ret %": "{:+.2f}%",
-                    "Short Ret %": "{:+.2f}%",
-                    "Total Ret %": "{:+.2f}%"
-                }).map(color_pnl, subset=["Long Ret %", "Short Ret %", "Total Ret %"]),
-                use_container_width=True, hide_index=True
+                m_df.style.format("{:+.2f}%").map(color_pnl),
+                use_container_width=True
             )
         else:
             st.info("No data available.")
@@ -644,8 +637,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
             invested_capital = pos['qty'] * pos['avg_cost']
             ret_pct = (unrealized_pnl / abs(invested_capital)) * 100 if invested_capital != 0 else 0.0
-
-            # Portfolio Percentage
             port_pct = (pos.get('mkt_val', 0) / state['equity']) * 100
 
             holdings_data.append({
@@ -671,7 +662,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     "Realized PnL": "{:+,.0f}",
                     "Return %": "{:+.2f}%",
                     "Port %": "{:.1f}%"
-                }).map(color_pnl, subset=["Return %"]),
+                }).map(color_pnl, subset=["Return %", "Unrealized PnL", "Realized PnL"]),
                 use_container_width=True,
                 hide_index=True
             )
@@ -685,6 +676,10 @@ def analyst_page(user, session_obj, is_pm_view=False):
             all_keys.add((tik, pos['type']))
         
         history_data = []
+        
+        # Stats for Hit Ratio
+        stats = {"LONG": {"win": 0, "total": 0}, "SHORT": {"win": 0, "total": 0}}
+        
         for (tik, side) in all_keys:
             realized = state['realized_pnl_by_side'].get((tik, side), 0.0)
             unrealized = 0.0
@@ -701,6 +696,24 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 "Total Net PnL": total_pnl
             })
             
+            if side in stats:
+                stats[side]["total"] += 1
+                if total_pnl > 0: stats[side]["win"] += 1
+        
+        # Calculate Hit Ratios
+        col_s1, col_s2, col_s3 = st.columns(3)
+        
+        long_rate = (stats["LONG"]["win"] / stats["LONG"]["total"] * 100) if stats["LONG"]["total"] > 0 else 0
+        short_rate = (stats["SHORT"]["win"] / stats["SHORT"]["total"] * 100) if stats["SHORT"]["total"] > 0 else 0
+        
+        total_wins = stats["LONG"]["win"] + stats["SHORT"]["win"]
+        total_pos = stats["LONG"]["total"] + stats["SHORT"]["total"]
+        total_rate = (total_wins / total_pos * 100) if total_pos > 0 else 0
+        
+        col_s1.metric("Long Hit Ratio", f"{long_rate:.1f}%", f"{stats['LONG']['win']}/{stats['LONG']['total']}")
+        col_s2.metric("Short Hit Ratio", f"{short_rate:.1f}%", f"{stats['SHORT']['win']}/{stats['SHORT']['total']}")
+        col_s3.metric("Total Hit Ratio", f"{total_rate:.1f}%", f"{total_wins}/{total_pos}")
+            
         if history_data:
             hist_df = pd.DataFrame(history_data).sort_values("Total Net PnL", ascending=False)
             st.dataframe(
@@ -708,7 +721,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     "Total Realized PnL": "{:+,.0f}",
                     "Total Unrealized PnL": "{:+,.0f}",
                     "Total Net PnL": "{:+,.0f}"
-                }).background_gradient(subset=["Total Net PnL"], cmap="RdYlGn", vmin=-5000, vmax=5000),
+                }).map(color_pnl, subset=["Total Realized PnL", "Total Unrealized PnL", "Total Net PnL"]),
                 use_container_width=True, hide_index=True
             )
         else:
@@ -716,12 +729,12 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     with t5:
         st.subheader("Transaction History")
-        hist_txs = session_obj.query(Transaction).filter_by(user_id=user.id).order_by(Transaction.date.desc()).all()
-        if hist_txs:
+        if txs_data:
             hist_data = []
-            for t in hist_txs:
-                cur = MARKET_CONFIG.get(t.market, {}).get('currency', 'USD')
-                p_display = t.local_price if t.local_price else t.price
+            sorted_txs = sorted(txs_data, key=lambda x: x['date'], reverse=True)
+            for t in sorted_txs:
+                cur = MARKET_CONFIG.get(t['market'], {}).get('currency', 'USD')
+                p_display = t['local_price'] if t['local_price'] else t['price']
                 if not p_display: p_display = 0.0
                 
                 if cur == 'USD':
@@ -730,14 +743,12 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     p_str = f"{p_display:,.2f} {cur}"
 
                 hist_data.append({
-                    "Date": t.date.strftime('%Y-%m-%d'),
-                    "Ticker": t.ticker,
-                    "Type": t.trans_type,
-                    "Amount (USD)": t.amount,
+                    "Date": t['date'].strftime('%Y-%m-%d'),
+                    "Ticker": t['ticker'],
+                    "Type": t['trans_type'],
+                    "Amount (USD)": t['amount'],
                     "Fill Price (Local)": p_str,
-                    "Quantity": t.quantity if t.quantity else 0,
-                    "Status": t.status,
-                    "Notes": t.notes
+                    "Quantity": t['quantity'] if t['quantity'] else 0
                 })
             
             h_df = pd.DataFrame(hist_data)
@@ -765,7 +776,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
             tik = col_b.text_input("Ticker Symbol").strip()
             side = col_c.selectbox("Order Type", ["BUY", "SELL", "SHORT_SELL", "BUY_TO_COVER"])
             
-            # Using fraction of equity might be easier, but sticking to shares for input
             qty_input = col_d.number_input("Quantity (Shares)", min_value=1.0, step=100.0)
             
             note = st.text_area("Investment Rationale / Notes", height=80)
@@ -792,100 +802,110 @@ def analyst_page(user, session_obj, is_pm_view=False):
                      st.error(f"Could not fetch price for {final_tik}. Cannot validate compliance.")
                      st.stop()
                 
-                est_amount = qty_input * est_usd_p
-                total_equity = state['equity']
-                
-                # --- COMPLIANCE ENGINE ---
+                # --- NEW COMPLIANCE ENGINE (POST-TRADE SIMULATION) ---
                 error_msg = None
                 warning_msg = None
                 
-                current_longs = [p for p in state['positions'].values() if p['type'] == 'LONG']
-                current_shorts = [p for p in state['positions'].values() if p['type'] == 'SHORT']
+                current_longs = {t: p for t, p in state['positions'].items() if p['type'] == 'LONG'}
+                current_shorts = {t: p for t, p in state['positions'].items() if p['type'] == 'SHORT'}
                 current_pos = state['positions'].get(final_tik)
                 
-                # Pre-calculate totals
-                total_long_val = sum(p['mkt_val'] for p in current_longs)
-                total_short_val = sum(p['mkt_val'] for p in current_shorts)
+                est_amount = qty_input * est_usd_p
                 
+                # Simulate Equity (Assume Cash Swap = No Immediate Equity Change)
+                sim_equity = state['equity'] 
+                
+                # Simulate Positions
+                sim_longs = current_longs.copy()
+                sim_shorts = current_shorts.copy()
+                
+                # Update specific position
+                if side == 'BUY':
+                    if final_tik in sim_longs:
+                        old_val = sim_longs[final_tik]['mkt_val']
+                        sim_longs[final_tik] = {'mkt_val': old_val + est_amount} # Simply update val
+                    else:
+                        sim_longs[final_tik] = {'mkt_val': est_amount}
+                        
+                elif side == 'SELL':
+                    if final_tik in sim_longs:
+                        old_val = sim_longs[final_tik]['mkt_val']
+                        new_val = old_val - est_amount
+                        if new_val < 100: # Assuming closed
+                            del sim_longs[final_tik]
+                        else:
+                            sim_longs[final_tik] = {'mkt_val': new_val}
+
+                elif side == 'SHORT_SELL':
+                    if final_tik in sim_shorts:
+                        old_val = sim_shorts[final_tik]['mkt_val']
+                        sim_shorts[final_tik] = {'mkt_val': old_val + est_amount}
+                    else:
+                        sim_shorts[final_tik] = {'mkt_val': est_amount}
+                
+                elif side == 'BUY_TO_COVER':
+                    if final_tik in sim_shorts:
+                        old_val = sim_shorts[final_tik]['mkt_val']
+                        new_val = old_val - est_amount
+                        if new_val < 100:
+                            del sim_shorts[final_tik]
+                        else:
+                            sim_shorts[final_tik] = {'mkt_val': new_val}
+
+                # --- CHECK RULES ON SIMULATED STATE ---
+                sim_long_total = sum(p['mkt_val'] for p in sim_longs.values())
+                sim_short_total = sum(p['mkt_val'] for p in sim_shorts.values())
+
                 # 1. LONG RULES
                 if side == 'BUY':
-                    # Rule: Max 5 positions
-                    if not current_pos and len(current_longs) >= 5:
-                        error_msg = "Compliance Violation: Max 5 Long positions allowed."
+                    if len(sim_longs) > 5:
+                        error_msg = f"Compliance Violation: Max 5 Long positions allowed (Projected: {len(sim_longs)})."
                     
-                    # Rule: Size 10% - 40%
-                    curr_val = current_pos['mkt_val'] if current_pos and current_pos['type']=='LONG' else 0
-                    proj_val = curr_val + est_amount
-                    pct_size = (proj_val / total_equity) * 100
+                    # Check SIZE of THIS position
+                    this_val = sim_longs[final_tik]['mkt_val']
+                    pct = (this_val / sim_equity) * 100
+                    if not (10.0 <= pct <= 40.0):
+                        if pct > 40.0: error_msg = f"Violation: Position size {pct:.1f}% exceeds 40%."
+                        elif pct < 10.0: warning_msg = f"⚠️ Warning: Position size {pct:.1f}% below 10%."
                     
-                    if not (10.0 <= pct_size <= 40.0):
-                        # Relax lower bound for initial entry if building position? 
-                        # User said "each long position size should be between", usually implies target.
-                        # We will block if > 40%, warn if < 10%
-                        if pct_size > 40.0:
-                             error_msg = f"Compliance Violation: Position size {pct_size:.1f}% exceeds limit (40%)."
-                        elif pct_size < 10.0:
-                             warning_msg = f"⚠️ Warning: Position size {pct_size:.1f}% is below target range (10%)."
-
-                    # Rule: Total Longs > 90%
-                    proj_total_long = total_long_val + est_amount
-                    if (proj_total_long / total_equity) < 0.90:
-                         if warning_msg: warning_msg += " Also, Total Long Exposure is < 90%."
-                         else: warning_msg = "⚠️ Warning: Total Long Exposure is below 90% target."
+                    if (sim_long_total / sim_equity) < 0.90:
+                         w = "Total Long Exposure below 90%."
+                         warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
                 # 2. SHORT RULES
                 if side == 'SHORT_SELL':
-                    # Rule: Max 3 positions
-                    if not current_pos and len(current_shorts) >= 3:
-                        error_msg = "Compliance Violation: Max 3 Short positions allowed."
+                    if len(sim_shorts) > 3:
+                        error_msg = f"Compliance Violation: Max 3 Short positions allowed (Projected: {len(sim_shorts)})."
                     
-                    # Rule: Size 10% - 30%
-                    curr_val = current_pos['mkt_val'] if current_pos and current_pos['type']=='SHORT' else 0
-                    proj_val = curr_val + est_amount
-                    pct_size = (proj_val / total_equity) * 100
+                    this_val = sim_shorts[final_tik]['mkt_val']
+                    pct = (this_val / sim_equity) * 100
+                    if not (10.0 <= pct <= 30.0):
+                         if pct > 30.0: error_msg = f"Violation: Short Position {pct:.1f}% exceeds 30%."
+                         elif pct < 10.0: warning_msg = f"⚠️ Warning: Short Position {pct:.1f}% below 10%."
                     
-                    if not (10.0 <= pct_size <= 30.0):
-                        if pct_size > 30.0:
-                             error_msg = f"Compliance Violation: Short Position {pct_size:.1f}% exceeds limit (30%)."
-                        elif pct_size < 10.0:
-                             warning_msg = f"⚠️ Warning: Short Position {pct_size:.1f}% is below target range (10%)."
-                    
-                    # Rule: Total Short 30% - 50%
-                    proj_total_short = total_short_val + est_amount
-                    proj_total_pct = (proj_total_short / total_equity) * 100
-                    
-                    if proj_total_pct > 50.0:
-                        error_msg = f"Compliance Violation: Total Short Exposure {proj_total_pct:.1f}% exceeds limit (50%)."
-                    elif proj_total_pct < 30.0:
-                         if warning_msg: warning_msg += " Total Short < 30%."
-                         else: warning_msg = "⚠️ Warning: Total Short Exposure is below 30% target."
+                    total_pct = (sim_short_total / sim_equity) * 100
+                    if total_pct > 50.0:
+                        error_msg = f"Violation: Total Short Exposure {total_pct:.1f}% exceeds 50%."
+                    elif total_pct < 30.0:
+                         w = "Total Short Exposure below 30%."
+                         warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
-                # 3. LOCKUP & EXCEPTION (Short Squeeze / Stop Loss)
+                # 3. LOCKUP (Existing logic remains valid for closing trades)
                 if side in ['SELL', 'BUY_TO_COVER']:
                     curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
-                    
                     if not current_pos:
                          error_msg = "Cannot close a position you don't hold."
                     else:
                         days_held = (curr_date - current_pos['first_entry']).days
-                        
-                        # Default strict rule
                         is_violation = days_held < 30
                         
-                        # Check Exception for Shorts
                         if is_violation and side == 'BUY_TO_COVER':
-                            # Calculate PnL %
-                            # Short PnL % = (Entry Price - Current Price) / Entry Price
-                            # Note: This is simplified. Using averages.
                             entry_p = current_pos['avg_cost']
                             curr_p = est_usd_p
                             pnl_pct = (entry_p - curr_p) / entry_p
-                            
-                            # Exception: > 15% Profit OR > 20% Loss (pnl < -0.20)
                             if pnl_pct > 0.15 or pnl_pct < -0.20:
                                 is_violation = False
-                                if warning_msg: warning_msg += f" (Lockup bypassed: PnL {pnl_pct*100:.1f}%)"
-                                else: warning_msg = f"⚠️ Lockup bypassed due to PnL trigger ({pnl_pct*100:.1f}%)."
+                                warning_msg = f"⚠️ Lockup bypassed due to PnL trigger ({pnl_pct*100:.1f}%)."
                         
                         if is_violation:
                              error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding 30 days."
@@ -904,6 +924,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                             local_price=est_local_p, price=est_usd_p, 
                             notes=f"[BACKDATE] {note}"
                         ))
+                        st.cache_data.clear()
                         session_obj.commit()
                         st.success(f"Filled {qty_input:,.0f} shares of {final_tik} @ {est_usd_p:.2f} USD")
                         time.sleep(1); st.rerun()
@@ -929,27 +950,41 @@ def pm_page(user, session_obj):
 
     summary = []
     
-    # Placeholders for breakdown tables
     monthly_data_frames = {} 
     
     progress = st.progress(0, text="Calculating Portfolio Analytics...")
     
+    # New: Collect just the Total Ret % row for the summary table
+    analyst_monthly_summary = {}
+
     for idx, a in enumerate(analysts):
-        s = calculate_portfolio_state(a.id, session_obj)
+        txs_data = fetch_user_transactions(a.id, session_obj)
+        s = calculate_portfolio_state_cached(txs_data, a.initial_capital)
+        
         total_ret_pct = ((s['equity'] / a.initial_capital) - 1) * 100
+        
+        long_exp = sum(p['mkt_val'] for p in s['positions'].values() if p['type'] == 'LONG')
+        short_exp = sum(p['mkt_val'] for p in s['positions'].values() if p['type'] == 'SHORT')
+        
+        gross_exp_pct = ((long_exp + short_exp) / s['equity']) * 100
+        net_exp_pct = ((long_exp - short_exp) / s['equity']) * 100
         
         summary.append({
             "Analyst": a.username, 
             "Equity": s['equity'], 
             "Cash %": (s['cash'] / s['equity']) * 100,
-            "YTD PnL": s['equity'] - a.initial_capital,
+            "Gross Exp": gross_exp_pct,
+            "Net Exp": net_exp_pct,
             "Total Ret %": total_ret_pct
         })
         
-        df_c, _ = get_ytd_performance(a.id, session_obj)
+        df_c, _ = get_ytd_performance_cached(txs_data, a.initial_capital)
         m_df = render_monthly_breakdown(df_c, a.initial_capital)
         if not m_df.empty:
             monthly_data_frames[a.username] = m_df
+            # Extract Total Ret row for the horizontal summary
+            if "Total Ret %" in m_df.index:
+                analyst_monthly_summary[a.username] = m_df.loc["Total Ret %"]
             
         progress.progress((idx + 1) / len(analysts))
 
@@ -960,26 +995,38 @@ def pm_page(user, session_obj):
     st.subheader("Leaderboard")
     st.dataframe(
         df_sum.style.format({
-            "Equity": "${:,.0f}", "YTD PnL": "{:+,.0f}", 
-            "Cash %": "{:.1f}%", "Total Ret %": "{:+.2f}%"
+            "Equity": "${:,.0f}", 
+            "Cash %": "{:.1f}%", 
+            "Gross Exp": "{:.1f}%",
+            "Net Exp": "{:.1f}%",
+            "Total Ret %": "{:+.2f}%"
         }).map(color_pnl, subset=["Total Ret %"]),
         use_container_width=True, hide_index=True
     )
+    
+    st.markdown("---")
+    st.subheader("Analyst Monthly Total Returns")
+    if analyst_monthly_summary:
+        # Create DataFrame from dict where keys are indices (Analysts) and values are Series (Months)
+        monthly_comp_df = pd.DataFrame(analyst_monthly_summary).T # Analysts as rows, Months as cols
+        st.dataframe(
+            monthly_comp_df.style.format("{:+.2f}%").map(color_pnl),
+            use_container_width=True
+        )
+    else:
+        st.info("No monthly data.")
 
     st.markdown("---")
-    st.subheader("Monthly Returns Breakdown")
+    st.subheader("Monthly Returns Breakdown (Detailed)")
     
     if monthly_data_frames:
         tabs = st.tabs(list(monthly_data_frames.keys()))
         for i, (name, df) in enumerate(monthly_data_frames.items()):
             with tabs[i]:
+                # Already transposed in helper
                 st.dataframe(
-                    df.style.format({
-                        "Long Ret %": "{:+.2f}%",
-                        "Short Ret %": "{:+.2f}%",
-                        "Total Ret %": "{:+.2f}%"
-                    }).map(color_pnl, subset=["Long Ret %", "Short Ret %", "Total Ret %"]),
-                    use_container_width=True, hide_index=True
+                    df.style.format("{:+.2f}%").map(color_pnl),
+                    use_container_width=True
                 )
     else:
         st.info("No monthly data available yet.")
