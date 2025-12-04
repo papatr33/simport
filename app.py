@@ -175,7 +175,7 @@ def calculate_portfolio_state(user_id, session_obj):
     state = {
         "cash": user.initial_capital,
         "positions": {}, 
-        "realized_pnl_ytd": {},
+        "realized_pnl_by_side": {}, # Key: (ticker, 'LONG'/'SHORT') -> amount
         "equity": 0.0
     }
 
@@ -203,7 +203,11 @@ def calculate_portfolio_state(user_id, session_obj):
             state["cash"] += t.amount
             cost_basis = t.quantity * pos["avg_cost"]
             pnl = t.amount - cost_basis
-            state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
+            
+            # Record Realized PnL specifically for LONG
+            key = (tik, 'LONG')
+            state["realized_pnl_by_side"][key] = state["realized_pnl_by_side"].get(key, 0) + pnl
+            
             pos["qty"] -= t.quantity
             if pos["qty"] <= 0.001: 
                 del state["positions"][tik]
@@ -221,7 +225,11 @@ def calculate_portfolio_state(user_id, session_obj):
             state["cash"] -= t.amount
             cost_basis = t.quantity * pos["avg_cost"]
             pnl = cost_basis - t.amount
-            state["realized_pnl_ytd"][tik] = state["realized_pnl_ytd"].get(tik, 0) + pnl
+            
+            # Record Realized PnL specifically for SHORT
+            key = (tik, 'SHORT')
+            state["realized_pnl_by_side"][key] = state["realized_pnl_by_side"].get(key, 0) + pnl
+            
             pos["qty"] += t.quantity
             if abs(pos["qty"]) <= 0.001: 
                 del state["positions"][tik]
@@ -483,7 +491,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     st.markdown("---")
 
-    t1, t2, t3 = st.tabs(["Performance Chart", "Current Holdings", "Transaction Log"])
+    t1, t2, t3, t4 = st.tabs(["Performance Chart", "Current Holdings", "All Historical Positions", "Transaction Log"])
     
     with t1:
         df_c, spy_c = get_ytd_performance(user.id, session_obj)
@@ -493,24 +501,25 @@ def analyst_page(user, session_obj, is_pm_view=False):
         st.subheader("Current Holdings")
         holdings_data = []
         for tik, pos in state['positions'].items():
-            pnl = pos.get('unrealized', 0)
+            unrealized_pnl = pos.get('unrealized', 0)
             
+            # Fetch Realized PnL specifically for this SIDE (Long vs Short)
+            # If position is Long, we only care about realized gains from Longs on this ticker
+            side_key = (tik, pos['type'])
+            realized_pnl = state['realized_pnl_by_side'].get(side_key, 0.0)
+
             # Use Local Price if available and not US
             loc_p = pos.get('current_local_price', 0)
             cur = MARKET_CONFIG.get(pos['market'], {}).get('currency', 'USD')
             
-            # Formatting Price String: "100.00 HKD" or "$150.00"
             if cur == 'USD':
                 price_str = f"${loc_p:,.2f}"
             else:
                 price_str = f"{loc_p:,.2f} {cur}"
 
-            # Return Calculation Corrected
-            # Short Return = PnL / Invested Capital (Abs Value)
-            # Long Return = PnL / Invested Capital
             invested_capital = pos['qty'] * pos['avg_cost']
             if invested_capital != 0:
-                ret_pct = (pnl / abs(invested_capital)) * 100
+                ret_pct = (unrealized_pnl / abs(invested_capital)) * 100
             else:
                 ret_pct = 0.0
 
@@ -520,7 +529,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 "Avg Cost": f"${pos['avg_cost']:,.2f}", 
                 "Current Price (Local)": price_str,
                 "Market Val (USD)": pos.get('mkt_val', 0),
-                "Unrealized PnL": pnl,
+                "Unrealized PnL": unrealized_pnl,
+                "Realized PnL": realized_pnl, # NEW COLUMN
                 "Return %": ret_pct,
                 "Entry Date": pos.get('first_entry').strftime('%Y-%m-%d') if pos.get('first_entry') else '-'
             })
@@ -531,6 +541,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 h_df.style.format({
                     "Market Val (USD)": "${:,.0f}", 
                     "Unrealized PnL": "{:+,.0f}",
+                    "Realized PnL": "{:+,.0f}",
                     "Return %": "{:+.2f}%"
                 }).background_gradient(subset=["Unrealized PnL", "Return %"], cmap="RdYlGn", vmin=-5000, vmax=5000),
                 use_container_width=True,
@@ -538,14 +549,53 @@ def analyst_page(user, session_obj, is_pm_view=False):
             )
         else:
             st.info("No active positions.")
-            
+
     with t3:
+        st.subheader("All Traded Positions (Historical)")
+        # We need to union keys from both 'positions' and 'realized_pnl_by_side'
+        # Keys are (ticker, side)
+        all_keys = set(state['realized_pnl_by_side'].keys())
+        for tik, pos in state['positions'].items():
+            all_keys.add((tik, pos['type']))
+        
+        history_data = []
+        for (tik, side) in all_keys:
+            realized = state['realized_pnl_by_side'].get((tik, side), 0.0)
+            
+            # Check if currently holding to get unrealized
+            unrealized = 0.0
+            if tik in state['positions'] and state['positions'][tik]['type'] == side:
+                unrealized = state['positions'][tik].get('unrealized', 0.0)
+            
+            total_pnl = realized + unrealized
+            
+            history_data.append({
+                "Ticker": tik,
+                "Side": side,
+                "Total Realized PnL": realized,
+                "Total Unrealized PnL": unrealized,
+                "Total Net PnL": total_pnl
+            })
+            
+        if history_data:
+            hist_df = pd.DataFrame(history_data).sort_values("Total Net PnL", ascending=False)
+            st.dataframe(
+                hist_df.style.format({
+                    "Total Realized PnL": "{:+,.0f}",
+                    "Total Unrealized PnL": "{:+,.0f}",
+                    "Total Net PnL": "{:+,.0f}"
+                }).background_gradient(subset=["Total Net PnL"], cmap="RdYlGn", vmin=-5000, vmax=5000),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("No trading history.")
+
+    with t4:
         st.subheader("Transaction History")
         hist_txs = session_obj.query(Transaction).filter_by(user_id=user.id).order_by(Transaction.date.desc()).all()
         if hist_txs:
             hist_data = []
             for t in hist_txs:
-                # Prepare Price String (Local)
                 cur = MARKET_CONFIG.get(t.market, {}).get('currency', 'USD')
                 p_display = t.local_price if t.local_price else t.price
                 if not p_display: p_display = 0.0
@@ -592,7 +642,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
             tik = col_b.text_input("Ticker Symbol").strip()
             side = col_c.selectbox("Order Type", ["BUY", "SELL", "SHORT_SELL", "BUY_TO_COVER"])
             
-            # 1. CHANGED INPUT TO SHARES
             qty_input = col_d.number_input("Quantity (Shares)", min_value=1.0, step=100.0)
             
             note = st.text_area("Investment Rationale / Notes", height=80)
@@ -608,20 +657,17 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 if not tik: st.error("Ticker is required"); st.stop()
                 final_tik = format_ticker(tik, mkt)
                 
-                # Fetch Real-Time Price for Estimation
                 if test_mode:
                     eval_date = datetime.combine(d_val, datetime.min.time())
                 else:
                     eval_date = datetime.now()
                 
-                # We need a price to calculate estimated USD Amount for compliance
                 est_local_p, est_usd_p = get_historical_price(final_tik, eval_date, mkt)
                 
                 if est_usd_p <= 0:
                      st.error(f"Could not fetch price for {final_tik}. Cannot validate compliance.")
                      st.stop()
                 
-                # Calculate Estimated USD Amount
                 est_amount = qty_input * est_usd_p
                 
                 # --- COMPLIANCE ENGINE ---
@@ -677,11 +723,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 else:
                     if warning_msg: st.warning(warning_msg)
                     
-                    # Transaction Creation
-                    # Note: We store the estimated amount for reference, but quantity is strict.
                     if test_mode:
                         h_date = datetime.combine(d_val, datetime.min.time())
-                        # Re-fetch exact if needed, but we have est_usd_p
                         session_obj.add(Transaction(
                             user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
                             status='FILLED', date=h_date, 
@@ -693,13 +736,11 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         st.success(f"Filled {qty_input:,.0f} shares of {final_tik} @ {est_usd_p:.2f} USD")
                         time.sleep(1); st.rerun()
                     else:
-                        # For Pending, we assume the user wants this Quantity.
-                        # The daily_job will need to be smart, but for now we store the intended params.
                         session_obj.add(Transaction(
                             user_id=user.id, ticker=final_tik, market=mkt, trans_type=side,
                             status='PENDING', 
-                            amount=est_amount, # Estimated amount
-                            quantity=qty_input, # Intended quantity
+                            amount=est_amount, 
+                            quantity=qty_input, 
                             notes=f"{note} (Est Price: ${est_usd_p:.2f})"
                         ))
                         session_obj.commit()
