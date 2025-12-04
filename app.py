@@ -315,6 +315,9 @@ def get_ytd_performance_cached(txs_data, initial_capital):
         dates = pd.date_range(start_date, end_date, freq='B')
         df = pd.DataFrame({'Date': dates, 'Equity': initial_capital})
         df['Return %'] = 0.0
+        # FIX: Initialize PnL columns for empty DataFrame
+        df['Long PnL'] = 0.0
+        df['Short PnL'] = 0.0
         return df, pd.Series()
 
     ticker_market_map = {}
