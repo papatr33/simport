@@ -140,25 +140,54 @@ def fetch_batch_data(tickers, start_date):
     except: return pd.DataFrame()
 
 def get_historical_price(ticker, date_obj, market):
-    # This is only used for new order entry, no need to cache aggressively
+    # This is only used for new order entry/validation
     try:
+        # 1. Try Forward/Current Window (Standard for T+1 / Live)
         start = date_obj
         end = date_obj + timedelta(days=5)
         df = yf.download(ticker, start=start, end=end, progress=False)
-        if df.empty: return 0.0, 0.0
         
-        local_p = extract_scalar(df['Open'].dropna().iloc[0])
+        local_p = 0.0
+        
+        if not df.empty:
+            # Use 'Open' if available for the requested date/future
+            local_p = extract_scalar(df['Open'].dropna().iloc[0])
+        else:
+            # 2. Fallback: If no price (e.g., Market Closed/Pre-market), check last 7 days
+            end_back = date_obj
+            start_back = date_obj - timedelta(days=7)
+            df_back = yf.download(ticker, start=start_back, end=end_back, progress=False)
+            
+            if not df_back.empty:
+                # Use the last known 'Close' for compliance validation
+                local_p = extract_scalar(df_back['Close'].dropna().iloc[-1])
+            else:
+                return 0.0, 0.0
+
         usd_p = local_p
 
         if market != "US":
             cfg = MARKET_CONFIG.get(market)
             if cfg and cfg['fx']:
+                # Same fallback logic for FX
                 fx_df = yf.download(cfg['fx'], start=start, end=end, progress=False)
+                rate = 0.0
                 if not fx_df.empty:
-                    rate = extract_scalar(fx_df['Close'].dropna().iloc[0])
+                    rate = extract_scalar(fx_df['Open'].dropna().iloc[0])
+                else:
+                    end_back = date_obj
+                    start_back = date_obj - timedelta(days=7)
+                    fx_df_back = yf.download(cfg['fx'], start=start_back, end=end_back, progress=False)
+                    if not fx_df_back.empty:
+                        rate = extract_scalar(fx_df_back['Close'].dropna().iloc[-1])
+                
+                if rate > 0:
                     if market == "UK": local_p = local_p / 100.0
-                    if rate > 0: usd_p = (local_p / 100.0 if market == "UK" else local_p) / rate
-                    else: usd_p = 0.0
+                    usd_p = (local_p / 100.0 if market == "UK" else local_p) / rate
+                else:
+                    # If we have price but no FX, return 0 (safer than wrong price)
+                    return 0.0, 0.0
+                    
         return local_p, usd_p
     except: return 0.0, 0.0
 
@@ -600,7 +629,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     st.markdown("---")
 
-    t1, t2, t3, t4, t5 = st.tabs(["Performance Chart", "Monthly Returns", "Current Holdings", "All Historical Positions", "Transaction Log"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(["Performance Chart", "Monthly Returns", "Current Holdings", "Pending Orders", "All Historical Positions", "Transaction Log"])
     
     df_c, spy_c = get_ytd_performance_cached(txs_data, user.initial_capital)
 
@@ -674,6 +703,28 @@ def analyst_page(user, session_obj, is_pm_view=False):
             st.info("No active positions.")
 
     with t4:
+        st.subheader("Queued (Pending) Orders")
+        # Query database directly for pending orders to allow for deletion interaction
+        pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
+        
+        if pending_txs:
+            for pt in pending_txs:
+                c1, c2, c3, c4, c5 = st.columns([2, 1, 2, 3, 1])
+                c1.text(f"{pt.date.strftime('%Y-%m-%d %H:%M')}")
+                c2.text(f"{pt.market}")
+                c3.text(f"{pt.trans_type} {pt.ticker}")
+                c4.text(f"${pt.amount:,.0f} (Approx)")
+                
+                if not is_pm_view:
+                    if c5.button("Delete", key=f"del_{pt.id}"):
+                        session_obj.delete(pt)
+                        session_obj.commit()
+                        st.rerun()
+            st.caption("Orders will be picked up by the execution engine shortly.")
+        else:
+            st.info("No pending orders in queue.")
+
+    with t5:
         st.subheader("All Traded Positions (Historical)")
         all_keys = set(state['realized_pnl_by_side'].keys())
         for tik, pos in state['positions'].items():
@@ -731,7 +782,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
         else:
             st.info("No trading history.")
 
-    with t5:
+    with t6:
         st.subheader("Transaction History")
         if txs_data:
             hist_data = []
