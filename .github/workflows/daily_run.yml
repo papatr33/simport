@@ -1,25 +1,33 @@
-name: Daily Portfolio Update
+name: High Frequency Trade Execution
 
 on:
   schedule:
-    - cron: '30 13 * * 1-5'
-  workflow_dispatch:  # <--- This line is what creates the button!
+    # Run every 10 minutes, but ONLY on Monday through Friday
+    # Cron syntax: minute hour day month day-of-week (1-5 is Mon-Fri)
+    # This prevents running up billable minutes on weekends when markets are closed.
+    - cron: '*/10 * * * 1-5'
+  
+  # Keep this so you can click "Run workflow" manually for testing at any time
+  workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v2
+      
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v2
         with:
           python-version: '3.9'
+          
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-      - name: Run Daily Job
+          pip install pandas sqlalchemy yfinance psycopg2-binary toml pytz
+          
+      - name: Run Execution Script
         env:
+          # Make sure these secrets are set in your Repo Settings -> Secrets
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}    <-- Uncomment if you added this secret
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }} <-- Uncomment if you added this secret
         run: python daily_job.py
