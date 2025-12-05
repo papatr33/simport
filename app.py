@@ -17,7 +17,7 @@ import numpy as np
 
 st.set_page_config(
     layout="wide", 
-    page_title="SPS",
+    page_title="AlphaTracker Pro",
     page_icon="📈"
 )
 
@@ -42,7 +42,8 @@ MARKET_CONFIG = {
     "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY"},
     "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
     "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"}, 
-    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"}
+    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"},
+    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR"}
 }
 
 # ==========================================
@@ -771,6 +772,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
             * **Longs:** Position: 10% - 40% of Equity. Total Longs: Must be > 90% of Equity. Max 5 Names.
             * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: 30% - 50% of Equity. Max 3 Names.
             * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
+            * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
             """)
 
         with st.form("order_form", clear_on_submit=True):
@@ -907,7 +909,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                          error_msg = "Cannot close a position you don't hold."
                     else:
                         days_held = (curr_date - current_pos['first_entry']).days
-                        is_violation = days_held < 2
+                        is_violation = days_held < 30
                         
                         if is_violation and side == 'BUY_TO_COVER':
                             entry_p = current_pos['avg_cost']
@@ -951,7 +953,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         time.sleep(1); st.rerun()
 
 def pm_page(user, session_obj):
-    st.title("📖 Portfolio Manager Dashboard")
+    st.title("👨‍💼 Portfolio Manager Dashboard")
     
     analysts = session_obj.query(User).filter_by(role='analyst').all()
     if not analysts:
@@ -1147,7 +1149,7 @@ def main():
                 st.session_state.user_id = None
                 st.rerun()
             st.markdown("---")
-            st.caption("SimPortfolioSystem v1.0")
+            st.caption("AlphaTracker v2.0")
 
         if user.role == 'admin':
             admin_page(session)
