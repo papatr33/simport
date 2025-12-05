@@ -8,6 +8,7 @@ import os
 import toml
 import pandas as pd
 import time
+import pytz
 
 # --- 1. CONFIGURATION (Must match app.py) ---
 # IPv4 Force for GitHub Actions
@@ -21,14 +22,17 @@ socket.getaddrinfo = new_getaddrinfo
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DailyJob")
 
+# UPDATED MARKET CONFIG with delays (minutes)
+# Ensure this matches app.py additions (Netherlands)
 MARKET_CONFIG = {
-    "US": {"suffix": "", "fx": None, "currency": "USD"},
-    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD"},
-    "China (Shanghai)": {"suffix": ".SS", "fx": "CNY=X", "currency": "CNY"},
-    "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY"},
-    "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
-    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"},
-    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"}
+    "US": {"suffix": "", "fx": None, "currency": "USD", "delay_min": 0},
+    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD", "delay_min": 0},
+    "China (Shanghai)": {"suffix": ".SS", "fx": "CNY=X", "currency": "CNY", "delay_min": 30},
+    "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY", "delay_min": 30},
+    "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY", "delay_min": 20},
+    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP", "delay_min": 15},
+    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR", "delay_min": 15},
+    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR", "delay_min": 15}
 }
 
 # --- 2. DB SETUP ---
@@ -95,46 +99,81 @@ def extract_scalar(val):
         return float(val)
     except: return 0.0
 
-def get_fill_data(ticker, market):
+def get_intraday_price(ticker, trade_time_utc):
     """
-    Fetches the most recent OPEN price and FX rate.
-    Returns: (local_price, usd_price)
+    Fetches 1-minute/5-minute data around the trade time to find the best fill price.
     """
     try:
-        # Fetch 5 days to ensure we get the latest trading day (handle weekends/holidays)
-        # We use 'Open' price for fills as per rules
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
+        # Buffer: fetch data from trade_time to +60 mins to ensure we catch a candle
+        start_t = trade_time_utc
+        end_t = trade_time_utc + timedelta(minutes=60) 
         
-        if hist.empty:
-            logger.error(f"No data found for {ticker}")
+        # Download 5m data (reliable intraday)
+        # yfinance handles timezone logic internally, usually returning UTC or local.
+        df = yf.download(ticker, start=start_t, end=end_t, interval="5m", progress=False)
+        
+        if df.empty:
+            logger.warning(f"No intraday data for {ticker} at {start_t}. Will try fallback.")
+            return None
+        
+        # Get the first available row (closest to trade time)
+        # Using 'Open' of the candle
+        price = extract_scalar(df['Open'].iloc[0])
+        return price
+    except Exception as e:
+        logger.error(f"Intraday fetch failed for {ticker}: {e}")
+        return None
+
+def get_fill_data(ticker, market, trade_time):
+    """
+    Fetches the price respecting delays.
+    """
+    try:
+        delay = MARKET_CONFIG.get(market, {}).get('delay_min', 0)
+        
+        # Calculate when data becomes available
+        data_available_time = trade_time + timedelta(minutes=delay)
+        now = datetime.now()
+        
+        # If current time is BEFORE data is available, we wait.
+        if now < data_available_time:
+            logger.info(f"WAITING: {ticker} needs delay of {delay}m. Data avail at {data_available_time.strftime('%H:%M')}. Current: {now.strftime('%H:%M')}")
             return None, None
-            
-        # Get the latest available 'Open'
-        local_p = extract_scalar(hist['Open'].iloc[-1])
         
+        # Data is theoretically available, fetch specific intraday candle
+        local_p = get_intraday_price(ticker, trade_time)
+        
+        if not local_p:
+             # Fallback to daily 'Open' if intraday fails 
+             # (e.g. trade was days ago, or yfinance didn't return 5m data)
+             logger.info(f"Intraday failed for {ticker}, trying Daily history...")
+             stock = yf.Ticker(ticker)
+             hist = stock.history(period="5d")
+             if not hist.empty:
+                 local_p = extract_scalar(hist['Open'].iloc[-1])
+             else:
+                 logger.error(f"Daily history also failed for {ticker}")
+                 return None, None
+
         # FX Conversion
         usd_p = local_p
         
         if market != "US":
             cfg = MARKET_CONFIG.get(market)
             if cfg and cfg['fx']:
+                # Simplification: Grab recent history close for FX
                 fx_hist = yf.Ticker(cfg['fx']).history(period="5d")
                 if not fx_hist.empty:
-                    rate = extract_scalar(fx_hist['Close'].iloc[-1]) # Use Close for FX
+                    rate = extract_scalar(fx_hist['Close'].iloc[-1]) 
                     
-                    # UK Adjustment
                     if market == "UK": local_p = local_p / 100.0
                     
-                    # Convert to USD (Assuming rate is Local per USD, e.g., HKD=X is 7.8)
                     if rate > 0:
                         usd_p = (local_p / 100.0) if market == "UK" else local_p
                         usd_p = usd_p / rate
                     else:
-                        logger.error(f"Zero FX rate for {ticker}")
                         return local_p, 0.0
                 else:
-                    logger.error(f"No FX data for {cfg['fx']}")
                     return local_p, 0.0
         
         return local_p, usd_p
@@ -145,28 +184,27 @@ def get_fill_data(ticker, market):
 
 # --- 5. MAIN TASK ---
 def task_fill_orders():
-    logger.info("Starting Daily Fill Job...")
+    logger.info("Starting High-Frequency Fill Job...")
     
-    # Fetch only PENDING orders
     pending = session.query(Transaction).filter_by(status='PENDING').all()
     
     if not pending:
-        logger.info("No pending orders found.")
+        logger.info("No pending orders.")
         return
 
     logger.info(f"Found {len(pending)} pending orders.")
 
     for t in pending:
         try:
-            logger.info(f"Processing {t.trans_type} {t.ticker} ({t.market})...")
+            logger.info(f"Checking {t.ticker} (Trade Time: {t.date})...")
             
-            # Determine Market if missing (Fallback)
             market = t.market if t.market else "US"
             
-            local_p, usd_p = get_fill_data(t.ticker, market)
+            # Pass trade time to get precise price
+            local_p, usd_p = get_fill_data(t.ticker, market, t.date)
             
             if usd_p and usd_p > 0:
-                # Calculate Quantity based on USD Amount and Calculated USD Price
+                # Execution Logic:
                 # Qty = USD Amount / USD Price
                 qty = t.amount / usd_p
                 
@@ -174,18 +212,18 @@ def task_fill_orders():
                 t.local_price = local_p
                 t.quantity = qty
                 t.status = 'FILLED'
-                t.date = datetime.now() # Mark filled time (now) or use market open time
                 
-                logger.info(f"SUCCESS: {t.ticker} filled @ ${usd_p:.2f} USD ({t.quantity:.4f} shares)")
+                # Note: We keep t.date as the original trade time for PnL tracking consistency
+                
+                logger.info(f"FILLED: {t.ticker} @ ${usd_p:.2f} USD")
             else:
-                logger.warning(f"SKIPPED: Could not determine valid price for {t.ticker}")
+                pass # Logged inside get_fill_data if waiting
                 
         except Exception as e:
-            logger.error(f"CRITICAL ERROR processing {t.ticker}: {e}")
-            # Optional: t.notes = f"Auto-fill failed: {str(e)}"
+            logger.error(f"Error processing {t.ticker}: {e}")
     
     session.commit()
-    logger.info("Job Complete. Database updated.")
+    logger.info("Cycle Complete.")
 
 if __name__ == "__main__":
     task_fill_orders()
