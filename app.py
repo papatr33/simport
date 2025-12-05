@@ -147,7 +147,7 @@ def get_historical_price(ticker, date_obj, market):
         df = yf.download(ticker, start=start, end=end, progress=False)
         if df.empty: return 0.0, 0.0
         
-        local_p = extract_scalar(df['Close'].dropna().iloc[0])
+        local_p = extract_scalar(df['Open'].dropna().iloc[0])
         usd_p = local_p
 
         if market != "US":
