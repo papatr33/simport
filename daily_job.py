@@ -10,7 +10,7 @@ import pandas as pd
 import time
 import pytz
 
-# --- 1. CONFIGURATION (Must match app.py) ---
+# --- 1. CONFIGURATION ---
 # IPv4 Force for GitHub Actions
 old_getaddrinfo = socket.getaddrinfo
 def new_getaddrinfo(*args, **kwargs):
@@ -19,19 +19,31 @@ def new_getaddrinfo(*args, **kwargs):
 socket.getaddrinfo = new_getaddrinfo
 
 # Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("DailyJob")
 
-# UPDATED MARKET CONFIG with delays (minutes)
+# MARKET CONFIG (Must match app.py)
 MARKET_CONFIG = {
     "US": {"suffix": "", "fx": None, "currency": "USD", "delay_min": 0},
-    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD", "delay_min": 15}, # Updated to 15
+    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD", "delay_min": 15},
     "China (Shanghai)": {"suffix": ".SS", "fx": "CNY=X", "currency": "CNY", "delay_min": 30},
     "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY", "delay_min": 30},
     "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY", "delay_min": 20},
-    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP", "delay_min": 20}, # Updated to 20
+    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP", "delay_min": 20},
     "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR", "delay_min": 15},
     "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR", "delay_min": 15}
+}
+
+# TIMEZONE MAP (For accurate delay calculation)
+MARKET_TIMEZONES = {
+    "US": "US/Eastern",
+    "Hong Kong": "Asia/Hong_Kong",
+    "China (Shanghai)": "Asia/Shanghai",
+    "China (Shenzhen)": "Asia/Shanghai",
+    "Japan": "Asia/Tokyo",
+    "UK": "Europe/London",
+    "France": "Europe/Paris",
+    "Netherlands": "Europe/Amsterdam"
 }
 
 # --- 2. DB SETUP ---
@@ -99,68 +111,77 @@ def extract_scalar(val):
 
 def get_fill_data(ticker, market, trade_time):
     """
-    Fetches the price respecting delays.
-    Strategies:
-    1. Check if we have passed the mandatory delay window.
-    2. If yes, fetch data starting from trade_time.
-    3. The first available data point (Open) is the execution price.
-       - If trade was during market hours: this is roughly trade_time price.
-       - If trade was pre/post market: this is the Next Session Open price.
+    Fetches the price respecting delays and Timezones.
     """
     try:
         delay = MARKET_CONFIG.get(market, {}).get('delay_min', 0)
         
-        # 1. Check Delay
-        data_available_time = trade_time + timedelta(minutes=delay)
-        now = datetime.now()
+        # --- 1. TIMEZONE & DELAY CHECK ---
+        # Determine Market Timezone
+        tz_name = MARKET_TIMEZONES.get(market, "UTC")
+        local_tz = pytz.timezone(tz_name)
         
-        if now < data_available_time:
-            logger.info(f"WAITING: {ticker} needs delay of {delay}m. Data avail at {data_available_time.strftime('%H:%M')}. Current: {now.strftime('%H:%M')}")
+        # A. Localize the Trade Time
+        # We assume the time in DB was entered as "Local Market Time" (naive)
+        if trade_time.tzinfo is None:
+            trade_time_aware = local_tz.localize(trade_time)
+        else:
+            trade_time_aware = trade_time.astimezone(local_tz)
+            
+        # B. Get "Now" in UTC
+        now_utc = datetime.now(pytz.utc)
+        
+        # C. Convert Trade Time to UTC for comparison
+        trade_time_utc = trade_time_aware.astimezone(pytz.utc)
+        
+        # D. Calculate when data becomes available (Trade Time + Delay)
+        data_available_utc = trade_time_utc + timedelta(minutes=delay)
+        
+        # E. The Check
+        if now_utc < data_available_utc:
+            logger.info(f"WAITING {ticker}: Current UTC {now_utc.strftime('%H:%M')} < Avail {data_available_utc.strftime('%H:%M')} (Delay {delay}m)")
             return None, None
         
-        # 2. Fetch Data
-        # We search forward up to 5 days to cover weekends/holidays if trade was placed on Friday night
-        start_t = trade_time
-        end_t = trade_time + timedelta(days=5)
+        # --- 2. FETCH DATA ---
+        # We search forward up to 5 days to cover weekends/holidays
+        # We pass the AWARE timestamp to yfinance, it usually handles it by converting to exchange time
+        start_t = trade_time_aware
+        end_t = trade_time_aware + timedelta(days=5)
         
-        # We assume execution happened in the past (since we waited for delay), 
-        # but if the trade is very recent, end_t might be in the future (yfinance handles this).
-        
-        # Try 5m interval for precision if within last 60 days
+        # Try 5m interval for precision if within last 55 days
         interval = "5m"
-        if (datetime.now() - trade_time).days > 55:
-            interval = "1d" # Fallback for very old pending orders
+        if (datetime.now(local_tz) - trade_time_aware).days > 55:
+            interval = "1d" 
             
         df = yf.download(ticker, start=start_t, end=end_t, interval=interval, progress=False)
         
         local_p = None
         
         if not df.empty:
-            # 3. Pick First Available Candle
-            # df['Open'].iloc[0] is the Open price of the first candle AFTER start_t.
-            # This correctly handles "Next Open" logic.
+            # Pick First Available Candle (Open Price)
+            # This logic works for both "Immediate Fill" and "Next Day Open"
             local_p = extract_scalar(df['Open'].iloc[0])
         else:
-            # If 5m returned nothing (maybe market holiday?), try Daily fallback just in case
+            # Fallback: Try Daily if 5m failed
             if interval == "5m":
                 df_daily = yf.download(ticker, start=start_t, end=end_t, interval="1d", progress=False)
                 if not df_daily.empty:
                     local_p = extract_scalar(df_daily['Open'].iloc[0])
         
         if local_p is None:
-            logger.info(f"No market data found yet for {ticker} starting {start_t} (Market closed?)")
+            logger.info(f"No market data found yet for {ticker} starting {start_t} (Market closed or Holiday?)")
             return None, None
 
-        # 4. FX Conversion
+        # --- 3. FX CONVERSION ---
         usd_p = local_p
         
         if market != "US":
             cfg = MARKET_CONFIG.get(market)
             if cfg and cfg['fx']:
-                # For FX, we grab the rate corresponding to the execution time window
-                # Simplification: Grab recent 5d history close, reliable enough for simulation
+                # Fetch FX rate for the same time window
                 fx_hist = yf.Ticker(cfg['fx']).history(period="5d")
                 if not fx_hist.empty:
+                    # Use most recent close for stability
                     rate = extract_scalar(fx_hist['Close'].iloc[-1]) 
                     
                     if market == "UK": local_p = local_p / 100.0
@@ -169,9 +190,10 @@ def get_fill_data(ticker, market, trade_time):
                         usd_p = (local_p / 100.0) if market == "UK" else local_p
                         usd_p = usd_p / rate
                     else:
-                        return local_p, 0.0 # Error in FX
+                        logger.error(f"FX Rate 0 detected for {cfg['fx']}")
+                        return local_p, 0.0 # Error
                 else:
-                    return local_p, 0.0 # FX data missing
+                    return local_p, 0.0 # FX missing
         
         return local_p, usd_p
 
@@ -181,7 +203,7 @@ def get_fill_data(ticker, market, trade_time):
 
 # --- 5. MAIN TASK ---
 def task_fill_orders():
-    logger.info("Starting High-Frequency Fill Job...")
+    logger.info("Starting High-Frequency Fill Job (Timezone Aware)...")
     
     pending = session.query(Transaction).filter_by(status='PENDING').all()
     
@@ -193,11 +215,10 @@ def task_fill_orders():
 
     for t in pending:
         try:
-            logger.info(f"Checking {t.ticker} (Trade Time: {t.date})...")
+            logger.info(f"Checking {t.ticker} (Trade Time: {t.date} | Market: {t.market})...")
             
             market = t.market if t.market else "US"
             
-            # Pass trade time to get precise price or next open
             local_p, usd_p = get_fill_data(t.ticker, market, t.date)
             
             if usd_p and usd_p > 0:
