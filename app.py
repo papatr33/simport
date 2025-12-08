@@ -703,44 +703,45 @@ def analyst_page(user, session_obj, is_pm_view=False):
             st.info("No active positions.")
 
     with t4:
-        st.subheader("Queued (Pending) Orders")
-        # Query database directly for pending orders
-        pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
-        
-        if pending_txs:
-            # 1. DISPLAY TABLE
-            p_data = []
-            for pt in pending_txs:
-                p_data.append({
-                    "ID": pt.id,
-                    "Date": pt.date.strftime('%Y-%m-%d %H:%M'),
-                    "Market": pt.market,
-                    "Type": pt.trans_type,
-                    "Ticker": pt.ticker,
-                    "Est. Amount ($)": f"${pt.amount:,.0f}"
-                })
+            st.subheader("Queued (Pending) Orders")
+            # Query database directly for pending orders
+            pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
             
-            st.table(pd.DataFrame(p_data))
-            
-            # 2. DELETE UI (Since st.table is static)
-            if not is_pm_view:
-                st.caption("Select an Order ID to cancel:")
-                col_del_1, col_del_2 = st.columns([3, 1])
-                with col_del_1:
-                    to_delete = st.selectbox("Order ID", options=[p["ID"] for p in p_data], label_visibility="collapsed")
-                with col_del_2:
-                    if st.button("Cancel Order", type="primary"):
-                        if to_delete:
-                            t_to_del = session_obj.query(Transaction).filter_by(id=to_delete).first()
-                            if t_to_del:
-                                session_obj.delete(t_to_del)
-                                session_obj.commit()
-                                st.success(f"Order {to_delete} cancelled.")
-                                time.sleep(1); st.rerun()
-            
-            st.caption("Orders will be picked up by the execution engine shortly.")
-        else:
-            st.info("No pending orders in queue.")
+            if pending_txs:
+                # --- MODIFICATION: Use st.table for display ---
+                p_data = []
+                for pt in pending_txs:
+                    p_data.append({
+                        "ID": pt.id,
+                        "Date": pt.date.strftime('%Y-%m-%d %H:%M'),
+                        "Market": pt.market,
+                        "Type": pt.trans_type,
+                        "Ticker": pt.ticker,
+                        "Est. Amount ($)": f"${pt.amount:,.0f}"
+                    })
+                
+                # Display readable table
+                st.table(pd.DataFrame(p_data))
+                
+                # Deletion UI (Required because st.table is not interactive)
+                if not is_pm_view:
+                    st.caption("Select an Order ID to cancel:")
+                    col_del_1, col_del_2 = st.columns([3, 1])
+                    with col_del_1:
+                        to_delete = st.selectbox("Order ID", options=[p["ID"] for p in p_data], label_visibility="collapsed")
+                    with col_del_2:
+                        if st.button("Cancel Order", type="primary"):
+                            if to_delete:
+                                t_to_del = session_obj.query(Transaction).filter_by(id=to_delete).first()
+                                if t_to_del:
+                                    session_obj.delete(t_to_del)
+                                    session_obj.commit()
+                                    st.success(f"Order {to_delete} cancelled.")
+                                    time.sleep(1); st.rerun()
+                
+                st.caption("Orders will be picked up by the execution engine shortly.")
+            else:
+                st.info("No pending orders in queue.")
 
     with t5:
         st.subheader("All Traded Positions (Historical)")
