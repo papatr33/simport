@@ -112,6 +112,7 @@ def extract_scalar(val):
 def get_fill_data(ticker, market, trade_time):
     """
     Fetches the price respecting delays and Timezones.
+    IMPROVED: Fetches full day intraday data to prevent "Day Open" fallback errors.
     """
     try:
         delay = MARKET_CONFIG.get(market, {}).get('delay_min', 0)
@@ -122,7 +123,6 @@ def get_fill_data(ticker, market, trade_time):
         local_tz = pytz.timezone(tz_name)
         
         # A. Localize the Trade Time
-        # We assume the time in DB was entered as "Local Market Time" (naive)
         if trade_time.tzinfo is None:
             trade_time_aware = local_tz.localize(trade_time)
         else:
@@ -142,33 +142,66 @@ def get_fill_data(ticker, market, trade_time):
             logger.info(f"WAITING {ticker}: Current UTC {now_utc.strftime('%H:%M')} < Avail {data_available_utc.strftime('%H:%M')} (Delay {delay}m)")
             return None, None
         
-        # --- 2. FETCH DATA ---
-        # We search forward up to 5 days to cover weekends/holidays
-        start_t = trade_time_aware
-        end_t = trade_time_aware + timedelta(days=5)
+        # --- 2. FETCH DATA (ROBUST METHOD) ---
+        # Strategy: Fetch data starting from the BEGINNING of the trade day.
+        # This increases the success rate of yfinance returning 5m data.
+        
+        # Start of the day (Midnight local time)
+        day_start = trade_time_aware.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # End search 5 days later (to handle weekends if trade was Friday)
+        search_end = day_start + timedelta(days=5)
         
         # Try 5m interval for precision if within last 55 days
         interval = "5m"
         if (datetime.now(local_tz) - trade_time_aware).days > 55:
             interval = "1d" 
+            logger.warning(f"{ticker}: Trade > 55 days old, forced to use Daily Open price.")
             
-        df = yf.download(ticker, start=start_t, end=end_t, interval=interval, progress=False)
+        # Download data starting from Midnight
+        df = yf.download(ticker, start=day_start, end=search_end, interval=interval, progress=False)
         
         local_p = None
         
         if not df.empty:
-            # Pick First Available Candle (Open Price)
-            # This logic works for both "Immediate Fill" and "Next Day Open"
-            local_p = extract_scalar(df['Open'].iloc[0])
-        else:
-            # Fallback: Try Daily if 5m failed
+            # IMPORTANT: Filter for candles strictly AFTER or ON the specific trade execution time
+            # We must ensure we filter using the same timezone awareness
+            
+            # yfinance returns timezone-aware indexes. Ensure trade_time_aware matches.
+            # We align everything to the DataFrame's timezone to be safe
+            df_tz = df.index.tz
+            target_time = trade_time_aware.astimezone(df_tz)
+            
+            # Slice: Give me all candles that happened AFTER my button click
+            valid_candles = df[df.index >= target_time]
+            
+            if not valid_candles.empty:
+                # The first available candle is our execution price
+                local_p = extract_scalar(valid_candles['Open'].iloc[0])
+                found_time = valid_candles.index[0]
+                logger.info(f"Price matched: Trade {trade_time_aware.strftime('%H:%M')} -> Fill {found_time.strftime('%H:%M')} @ {local_p}")
+            else:
+                # We have data for the day, but nothing after the trade time (e.g. trade placed at 15:59 and market closed)
+                # In this case, we look for the next day in the original df
+                logger.info(f"No intraday data found after {trade_time_aware.strftime('%H:%M')} on same day. Looking for next open...")
+                future_candles = df[df.index > target_time]
+                if not future_candles.empty:
+                    local_p = extract_scalar(future_candles['Open'].iloc[0])
+        
+        # Fallback: If 5m completely failed (empty), try Daily
+        if local_p is None:
             if interval == "5m":
-                df_daily = yf.download(ticker, start=start_t, end=end_t, interval="1d", progress=False)
+                logger.warning(f"5m data missing for {ticker}. Falling back to Daily Open.")
+                df_daily = yf.download(ticker, start=day_start, end=search_end, interval="1d", progress=False)
+                # Same logic: Find first day >= trade date
                 if not df_daily.empty:
-                    local_p = extract_scalar(df_daily['Open'].iloc[0])
+                    # Filter for days on or after trade date
+                    valid_days = df_daily[df_daily.index.date >= trade_time_aware.date()]
+                    if not valid_days.empty:
+                         local_p = extract_scalar(valid_days['Open'].iloc[0])
         
         if local_p is None:
-            logger.info(f"No market data found yet for {ticker} starting {start_t} (Market closed or Holiday?)")
+            logger.info(f"No market data found for {ticker} (Market closed/Holiday?)")
             return None, None
 
         # --- 3. FX CONVERSION ---
@@ -180,7 +213,6 @@ def get_fill_data(ticker, market, trade_time):
                 # Fetch FX rate for the same time window
                 fx_hist = yf.Ticker(cfg['fx']).history(period="5d")
                 if not fx_hist.empty:
-                    # Use most recent close for stability
                     rate = extract_scalar(fx_hist['Close'].iloc[-1]) 
                     
                     if market == "UK": local_p = local_p / 100.0
@@ -198,8 +230,11 @@ def get_fill_data(ticker, market, trade_time):
 
     except Exception as e:
         logger.error(f"Error fetching data for {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
-
+    
+    
 # --- 5. MAIN TASK ---
 def task_fill_orders():
     logger.info("Starting High-Frequency Fill Job (Timezone Aware)...")
