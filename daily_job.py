@@ -111,91 +111,78 @@ def extract_scalar(val):
 
 def get_fill_data(ticker, market, trade_time):
     """
-    Fetches the price respecting delays and Timezones.
-    IMPROVED: Fetches full day intraday data to prevent "Day Open" fallback errors.
+    Fetches the price with STRICT Timezone Alignment.
+    Prevents 'Naive Comparison' bugs where 09:30 (Local) > 05:44 (UTC).
     """
     try:
         delay = MARKET_CONFIG.get(market, {}).get('delay_min', 0)
         
         # --- 1. TIMEZONE & DELAY CHECK ---
-        # Determine Market Timezone
         tz_name = MARKET_TIMEZONES.get(market, "UTC")
         local_tz = pytz.timezone(tz_name)
         
-        # A. Localize the Trade Time
+        # Localize Trade Time
         if trade_time.tzinfo is None:
             trade_time_aware = local_tz.localize(trade_time)
         else:
             trade_time_aware = trade_time.astimezone(local_tz)
             
-        # B. Get "Now" in UTC
         now_utc = datetime.now(pytz.utc)
-        
-        # C. Convert Trade Time to UTC for comparison
         trade_time_utc = trade_time_aware.astimezone(pytz.utc)
-        
-        # D. Calculate when data becomes available (Trade Time + Delay)
         data_available_utc = trade_time_utc + timedelta(minutes=delay)
         
-        # E. The Check
         if now_utc < data_available_utc:
             logger.info(f"WAITING {ticker}: Current UTC {now_utc.strftime('%H:%M')} < Avail {data_available_utc.strftime('%H:%M')} (Delay {delay}m)")
             return None, None
         
-        # --- 2. FETCH DATA (ROBUST METHOD) ---
-        # Strategy: Fetch data starting from the BEGINNING of the trade day.
-        # This increases the success rate of yfinance returning 5m data.
-        
-        # Start of the day (Midnight local time)
+        # --- 2. FETCH DATA ---
         day_start = trade_time_aware.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # End search 5 days later (to handle weekends if trade was Friday)
         search_end = day_start + timedelta(days=5)
         
-        # Try 5m interval for precision if within last 55 days
         interval = "5m"
         if (datetime.now(local_tz) - trade_time_aware).days > 55:
             interval = "1d" 
-            logger.warning(f"{ticker}: Trade > 55 days old, forced to use Daily Open price.")
             
-        # Download data starting from Midnight
         df = yf.download(ticker, start=day_start, end=search_end, interval=interval, progress=False)
         
         local_p = None
         
         if not df.empty:
-            # IMPORTANT: Filter for candles strictly AFTER or ON the specific trade execution time
-            # We must ensure we filter using the same timezone awareness
+            # --- 2B. STRICT TIMEZONE NORMALIZATION ---
+            # Problem: yfinance index can be "Naive Local", "Naive UTC", or "Aware".
+            # Solution: Force everything to UTC Aware.
             
-            # yfinance returns timezone-aware indexes. Ensure trade_time_aware matches.
-            # We align everything to the DataFrame's timezone to be safe
-            df_tz = df.index.tz
-            target_time = trade_time_aware.astimezone(df_tz)
+            if df.index.tz is None:
+                # If naive, assume it implies Market Local Time (e.g. 09:30 for HK Open)
+                # Localize to HK Time, then convert to UTC
+                df.index = df.index.tz_localize(local_tz, ambiguous='NaT', nonexistent='shift_forward')
+                df.index = df.index.tz_convert(pytz.utc)
+            else:
+                # If already aware, just ensure it's UTC
+                df.index = df.index.tz_convert(pytz.utc)
             
-            # Slice: Give me all candles that happened AFTER my button click
-            valid_candles = df[df.index >= target_time]
+            # Now both sides of the comparison are strictly UTC
+            target_time_utc = trade_time_aware.astimezone(pytz.utc)
+            
+            # Filter: Candles >= Trade Time
+            valid_candles = df[df.index >= target_time_utc]
             
             if not valid_candles.empty:
-                # The first available candle is our execution price
                 local_p = extract_scalar(valid_candles['Open'].iloc[0])
                 found_time = valid_candles.index[0]
-                logger.info(f"Price matched: Trade {trade_time_aware.strftime('%H:%M')} -> Fill {found_time.strftime('%H:%M')} @ {local_p}")
+                logger.info(f"Price matched: Trade {target_time_utc.strftime('%H:%M')} UTC -> Fill {found_time.strftime('%H:%M')} UTC @ {local_p}")
             else:
-                # We have data for the day, but nothing after the trade time (e.g. trade placed at 15:59 and market closed)
-                # In this case, we look for the next day in the original df
-                logger.info(f"No intraday data found after {trade_time_aware.strftime('%H:%M')} on same day. Looking for next open...")
-                future_candles = df[df.index > target_time]
+                logger.info(f"No intraday data found after {target_time_utc.strftime('%H:%M')} UTC on same day. Looking for next open...")
+                future_candles = df[df.index > target_time_utc]
                 if not future_candles.empty:
                     local_p = extract_scalar(future_candles['Open'].iloc[0])
         
-        # Fallback: If 5m completely failed (empty), try Daily
+        # Fallback to Daily
         if local_p is None:
             if interval == "5m":
-                logger.warning(f"5m data missing for {ticker}. Falling back to Daily Open.")
+                logger.warning(f"5m data missing/filtered out for {ticker}. Falling back to Daily.")
                 df_daily = yf.download(ticker, start=day_start, end=search_end, interval="1d", progress=False)
-                # Same logic: Find first day >= trade date
                 if not df_daily.empty:
-                    # Filter for days on or after trade date
                     valid_days = df_daily[df_daily.index.date >= trade_time_aware.date()]
                     if not valid_days.empty:
                          local_p = extract_scalar(valid_days['Open'].iloc[0])
@@ -210,34 +197,28 @@ def get_fill_data(ticker, market, trade_time):
         if market != "US":
             cfg = MARKET_CONFIG.get(market)
             if cfg and cfg['fx']:
-                # Fetch FX rate for the same time window
                 fx_hist = yf.Ticker(cfg['fx']).history(period="5d")
                 if not fx_hist.empty:
                     rate = extract_scalar(fx_hist['Close'].iloc[-1]) 
-                    
                     if market == "UK": local_p = local_p / 100.0
-                    
                     if rate > 0:
                         usd_p = (local_p / 100.0) if market == "UK" else local_p
                         usd_p = usd_p / rate
                     else:
                         logger.error(f"FX Rate 0 detected for {cfg['fx']}")
-                        return local_p, 0.0 # Error
+                        return local_p, 0.0 
                 else:
-                    return local_p, 0.0 # FX missing
+                    return local_p, 0.0 
         
         return local_p, usd_p
 
     except Exception as e:
         logger.error(f"Error fetching data for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
         return None, None
-    
-    
+
 # --- 5. MAIN TASK ---
 def task_fill_orders():
-    logger.info("Starting High-Frequency Fill Job (Timezone Aware)...")
+    logger.info("Starting High-Frequency Fill Job (Strict TZ)...")
     
     pending = session.query(Transaction).filter_by(status='PENDING').all()
     
@@ -256,12 +237,8 @@ def task_fill_orders():
             local_p, usd_p = get_fill_data(t.ticker, market, t.date)
             
             if usd_p and usd_p > 0:
-                # --- MODIFIED EXECUTION LOGIC ---
-                # Use the Quantity the Analyst requested.
-                # Recalculate the USD Amount based on execution price.
                 qty = t.quantity
                 if not qty or qty <= 0:
-                    # Fallback if quantity wasn't saved correctly (backward compatibility)
                     qty = t.amount / usd_p if t.amount else 0
                 
                 final_amount = qty * usd_p
@@ -269,12 +246,12 @@ def task_fill_orders():
                 t.price = usd_p
                 t.local_price = local_p
                 t.quantity = qty
-                t.amount = final_amount # Update with actual filled value
+                t.amount = final_amount
                 t.status = 'FILLED'
                 
                 logger.info(f"FILLED: {t.ticker} | Qty: {qty} | Price: ${usd_p:.2f} | Amt: ${final_amount:.0f}")
             else:
-                pass # Already logged waiting message
+                pass 
                 
         except Exception as e:
             logger.error(f"Error processing {t.ticker}: {e}")
