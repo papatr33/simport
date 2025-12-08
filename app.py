@@ -1009,7 +1009,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
                          error_msg = "Cannot close a position you don't hold."
                     else:
                         days_held = (curr_date - current_pos['first_entry']).days
-                        is_violation = days_held < 30
+                        lockup_days = 2
+                        is_violation = days_held < lockup_days
                         
                         if is_violation and side == 'BUY_TO_COVER':
                             entry_p = current_pos['avg_cost']
@@ -1020,7 +1021,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                                 warning_msg = f"⚠️ Lockup bypassed due to PnL trigger ({pnl_pct*100:.1f}%)."
                         
                         if is_violation:
-                             error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding 30 days."
+                             error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding {lockup_days} days."
 
                 if error_msg:
                     st.error(error_msg)
