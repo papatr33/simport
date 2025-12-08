@@ -11,18 +11,15 @@ import time
 import pytz
 
 # --- 1. CONFIGURATION ---
-# IPv4 Force for GitHub Actions
 old_getaddrinfo = socket.getaddrinfo
 def new_getaddrinfo(*args, **kwargs):
     responses = old_getaddrinfo(*args, **kwargs)
     return [response for response in responses if response[0] == socket.AF_INET]
 socket.getaddrinfo = new_getaddrinfo
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("DailyJob")
 
-# MARKET CONFIG (Must match app.py)
 MARKET_CONFIG = {
     "US": {"suffix": "", "fx": None, "currency": "USD", "delay_min": 0},
     "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD", "delay_min": 15},
@@ -34,7 +31,7 @@ MARKET_CONFIG = {
     "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR", "delay_min": 15}
 }
 
-# TIMEZONE MAP (For accurate delay calculation)
+# CRITICAL: Map Markets to their Local Timezones to interpret YFinance data correctly
 MARKET_TIMEZONES = {
     "US": "US/Eastern",
     "Hong Kong": "Asia/Hong_Kong",
@@ -68,7 +65,6 @@ def get_engine():
 
 Base = declarative_base()
 
-# --- 3. MODELS ---
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
@@ -111,79 +107,90 @@ def extract_scalar(val):
 
 def get_fill_data(ticker, market, trade_time):
     """
-    Fetches the price with STRICT Timezone Alignment.
-    Prevents 'Naive Comparison' bugs where 09:30 (Local) > 05:44 (UTC).
+    Fetches price with STRICT UTC NORMALIZATION for both Trade Time and Market Data.
     """
     try:
         delay = MARKET_CONFIG.get(market, {}).get('delay_min', 0)
         
-        # --- 1. TIMEZONE & DELAY CHECK ---
+        # 1. SETUP TIMEZONES
+        # We need the Market TZ to interpret Naive YFinance data correctly
         tz_name = MARKET_TIMEZONES.get(market, "UTC")
-        local_tz = pytz.timezone(tz_name)
+        market_tz = pytz.timezone(tz_name)
         
-        # Localize Trade Time
+        # 2. STANDARDIZE TRADE TIME TO UTC
+        # The DB stores naive UTC (per your setup). We force it to be UTC Aware.
         if trade_time.tzinfo is None:
-            trade_time_aware = local_tz.localize(trade_time)
+            trade_time_utc = trade_time.replace(tzinfo=pytz.utc)
         else:
-            trade_time_aware = trade_time.astimezone(local_tz)
-            
+            trade_time_utc = trade_time.astimezone(pytz.utc)
+        
+        # 3. CHECK DELAY
         now_utc = datetime.now(pytz.utc)
-        trade_time_utc = trade_time_aware.astimezone(pytz.utc)
         data_available_utc = trade_time_utc + timedelta(minutes=delay)
         
         if now_utc < data_available_utc:
-            logger.info(f"WAITING {ticker}: Current UTC {now_utc.strftime('%H:%M')} < Avail {data_available_utc.strftime('%H:%M')} (Delay {delay}m)")
+            logger.info(f"WAITING {ticker}: Current {now_utc.strftime('%H:%M')} UTC < Avail {data_available_utc.strftime('%H:%M')} UTC")
             return None, None
         
-        # --- 2. FETCH DATA ---
-        day_start = trade_time_aware.replace(hour=0, minute=0, second=0, microsecond=0)
-        search_end = day_start + timedelta(days=5)
+        # 4. FETCH DATA (Full Day Strategy)
+        # We search from the beginning of the trade day (in UTC)
+        day_start_utc = trade_time_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        search_end_utc = day_start_utc + timedelta(days=5)
         
         interval = "5m"
-        if (datetime.now(local_tz) - trade_time_aware).days > 55:
-            interval = "1d" 
+        # If trade is older than 55 days, yfinance 5m is unavailable
+        if (datetime.now(pytz.utc) - trade_time_utc).days > 55:
+            interval = "1d"
             
-        df = yf.download(ticker, start=day_start, end=search_end, interval=interval, progress=False)
+        df = yf.download(ticker, start=day_start_utc, end=search_end_utc, interval=interval, progress=False)
         
         local_p = None
         
         if not df.empty:
-            # --- 2B. STRICT TIMEZONE NORMALIZATION ---
-            # Problem: yfinance index can be "Naive Local", "Naive UTC", or "Aware".
-            # Solution: Force everything to UTC Aware.
-            
+            # --- CRITICAL: NORMALIZE YFINANCE INDEX TO UTC ---
+            # Scenario A: YFinance returns Naive timestamps (e.g. 09:30).
+            # We MUST assume this is Market Local Time (Asia/Hong_Kong).
             if df.index.tz is None:
-                # If naive, assume it implies Market Local Time (e.g. 09:30 for HK Open)
-                # Localize to HK Time, then convert to UTC
-                df.index = df.index.tz_localize(local_tz, ambiguous='NaT', nonexistent='shift_forward')
+                # 1. Localize to Market Time (09:30 HK)
+                df.index = df.index.tz_localize(market_tz, ambiguous='NaT', nonexistent='shift_forward')
+                # 2. Convert to UTC (01:30 UTC)
                 df.index = df.index.tz_convert(pytz.utc)
             else:
-                # If already aware, just ensure it's UTC
+                # Scenario B: YFinance returns Aware timestamps. Just convert to UTC.
                 df.index = df.index.tz_convert(pytz.utc)
             
-            # Now both sides of the comparison are strictly UTC
-            target_time_utc = trade_time_aware.astimezone(pytz.utc)
-            
-            # Filter: Candles >= Trade Time
-            valid_candles = df[df.index >= target_time_utc]
+            # 5. FILTER: Find candles AFTER the Trade Time
+            # Now both side are strictly UTC. 
+            # 01:30 UTC (Open) < 05:44 UTC (Trade) --> False
+            # 05:45 UTC (Next Candle) > 05:44 UTC (Trade) --> True (Match)
+            valid_candles = df[df.index >= trade_time_utc]
             
             if not valid_candles.empty:
                 local_p = extract_scalar(valid_candles['Open'].iloc[0])
                 found_time = valid_candles.index[0]
-                logger.info(f"Price matched: Trade {target_time_utc.strftime('%H:%M')} UTC -> Fill {found_time.strftime('%H:%M')} UTC @ {local_p}")
+                logger.info(f"MATCH: Trade {trade_time_utc.strftime('%H:%M')} UTC -> Fill {found_time.strftime('%H:%M')} UTC @ {local_p}")
             else:
-                logger.info(f"No intraday data found after {target_time_utc.strftime('%H:%M')} UTC on same day. Looking for next open...")
-                future_candles = df[df.index > target_time_utc]
+                # No data found today after trade time (e.g. trade placed after close)
+                # Look for the very next candle available in the future
+                future_candles = df[df.index > trade_time_utc]
                 if not future_candles.empty:
                     local_p = extract_scalar(future_candles['Open'].iloc[0])
-        
-        # Fallback to Daily
+                    found_time = future_candles.index[0]
+                    logger.info(f"NEXT OPEN: Trade {trade_time_utc.strftime('%H:%M')} UTC -> Fill {found_time.strftime('%H:%M')} UTC @ {local_p}")
+
+        # Fallback to Daily if 5m failed
         if local_p is None:
             if interval == "5m":
-                logger.warning(f"5m data missing/filtered out for {ticker}. Falling back to Daily.")
-                df_daily = yf.download(ticker, start=day_start, end=search_end, interval="1d", progress=False)
+                logger.warning(f"5m data missing for {ticker}. Trying Daily.")
+                df_daily = yf.download(ticker, start=day_start_utc, end=search_end_utc, interval="1d", progress=False)
                 if not df_daily.empty:
-                    valid_days = df_daily[df_daily.index.date >= trade_time_aware.date()]
+                    # Normalize Daily Index too
+                    if df_daily.index.tz is None:
+                        df_daily.index = df_daily.index.tz_localize(market_tz).tz_convert(pytz.utc)
+                    else:
+                        df_daily.index = df_daily.index.tz_convert(pytz.utc)
+                        
+                    valid_days = df_daily[df_daily.index >= trade_time_utc]
                     if not valid_days.empty:
                          local_p = extract_scalar(valid_days['Open'].iloc[0])
         
@@ -191,7 +198,7 @@ def get_fill_data(ticker, market, trade_time):
             logger.info(f"No market data found for {ticker} (Market closed/Holiday?)")
             return None, None
 
-        # --- 3. FX CONVERSION ---
+        # --- 6. FX CONVERSION ---
         usd_p = local_p
         
         if market != "US":
@@ -205,7 +212,6 @@ def get_fill_data(ticker, market, trade_time):
                         usd_p = (local_p / 100.0) if market == "UK" else local_p
                         usd_p = usd_p / rate
                     else:
-                        logger.error(f"FX Rate 0 detected for {cfg['fx']}")
                         return local_p, 0.0 
                 else:
                     return local_p, 0.0 
@@ -216,9 +222,8 @@ def get_fill_data(ticker, market, trade_time):
         logger.error(f"Error fetching data for {ticker}: {e}")
         return None, None
 
-# --- 5. MAIN TASK ---
 def task_fill_orders():
-    logger.info("Starting High-Frequency Fill Job (Strict TZ)...")
+    logger.info("Starting High-Frequency Fill Job (Strict UTC)...")
     
     pending = session.query(Transaction).filter_by(status='PENDING').all()
     
@@ -237,9 +242,10 @@ def task_fill_orders():
             local_p, usd_p = get_fill_data(t.ticker, market, t.date)
             
             if usd_p and usd_p > 0:
+                # Use Qty from input, calculate Amount
                 qty = t.quantity
                 if not qty or qty <= 0:
-                    qty = t.amount / usd_p if t.amount else 0
+                     qty = t.amount / usd_p if t.amount else 0
                 
                 final_amount = qty * usd_p
                 
