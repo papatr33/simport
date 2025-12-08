@@ -704,22 +704,40 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
     with t4:
         st.subheader("Queued (Pending) Orders")
-        # Query database directly for pending orders to allow for deletion interaction
+        # Query database directly for pending orders
         pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
         
         if pending_txs:
+            # 1. DISPLAY TABLE
+            p_data = []
             for pt in pending_txs:
-                c1, c2, c3, c4, c5 = st.columns([2, 1, 2, 3, 1])
-                c1.text(f"{pt.date.strftime('%Y-%m-%d %H:%M')}")
-                c2.text(f"{pt.market}")
-                c3.text(f"{pt.trans_type} {pt.ticker}")
-                c4.text(f"${pt.amount:,.0f} (Approx)")
-                
-                if not is_pm_view:
-                    if c5.button("Delete", key=f"del_{pt.id}"):
-                        session_obj.delete(pt)
-                        session_obj.commit()
-                        st.rerun()
+                p_data.append({
+                    "ID": pt.id,
+                    "Date": pt.date.strftime('%Y-%m-%d %H:%M'),
+                    "Market": pt.market,
+                    "Type": pt.trans_type,
+                    "Ticker": pt.ticker,
+                    "Est. Amount ($)": f"${pt.amount:,.0f}"
+                })
+            
+            st.table(pd.DataFrame(p_data))
+            
+            # 2. DELETE UI (Since st.table is static)
+            if not is_pm_view:
+                st.caption("Select an Order ID to cancel:")
+                col_del_1, col_del_2 = st.columns([3, 1])
+                with col_del_1:
+                    to_delete = st.selectbox("Order ID", options=[p["ID"] for p in p_data], label_visibility="collapsed")
+                with col_del_2:
+                    if st.button("Cancel Order", type="primary"):
+                        if to_delete:
+                            t_to_del = session_obj.query(Transaction).filter_by(id=to_delete).first()
+                            if t_to_del:
+                                session_obj.delete(t_to_del)
+                                session_obj.commit()
+                                st.success(f"Order {to_delete} cancelled.")
+                                time.sleep(1); st.rerun()
+            
             st.caption("Orders will be picked up by the execution engine shortly.")
         else:
             st.info("No pending orders in queue.")
@@ -820,8 +838,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
         
         with st.expander("Compliance Rules Summary"):
             st.markdown("""
-            * **Longs:** Position: 10% - 40% of Equity. Total Longs: Must be > 90% of Equity. Max 5 Names.
-            * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: 30% - 50% of Equity. Max 3 Names.
+            * **Longs:** Position: 10% - 40% of Equity. Total Longs: Min 90% - Max 100% of Equity. Max 5 Names.
+            * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: Max 50% of Equity. Max 3 Names.
             * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
             * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
             """)
@@ -927,10 +945,15 @@ def analyst_page(user, session_obj, is_pm_view=False):
                             elif pct < 10.0: 
                                 error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% is below min limit (10%)."
                     
-                    # Total Long Exposure (Warning Only for now as ramping up takes time, or could be strict)
-                    if (sim_long_total / sim_equity) < 0.90:
-                         w = "Total Long Exposure below 90%."
+                    # Total Long Exposure Checks
+                    long_exp_pct = (sim_long_total / sim_equity) * 100
+                    if long_exp_pct < 90.0:
+                         w = f"Total Long Exposure {long_exp_pct:.1f}% below target 90%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
+                    
+                    # ADDED: Max Total Long Check (e.g. 100%)
+                    if long_exp_pct > 100.0:
+                        error_msg = f"Compliance Violation: Total Long Exposure {long_exp_pct:.1f}% exceeds max limit (100%)."
 
                 # 2. SHORT RULES (SHORT_SELL or COVER/TRIM)
                 if side in ['SHORT_SELL', 'BUY_TO_COVER']:
@@ -946,6 +969,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                              elif pct < 10.0: 
                                  error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% is below min limit (10%)."
                     
+                    # STRICT: Total Short Max Check
                     total_pct = (sim_short_total / sim_equity) * 100
                     if total_pct > 50.0:
                         error_msg = f"Compliance Violation: Total Short Exposure {total_pct:.1f}% exceeds max limit (50%)."
