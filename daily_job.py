@@ -144,7 +144,6 @@ def get_fill_data(ticker, market, trade_time):
         
         # --- 2. FETCH DATA ---
         # We search forward up to 5 days to cover weekends/holidays
-        # We pass the AWARE timestamp to yfinance, it usually handles it by converting to exchange time
         start_t = trade_time_aware
         end_t = trade_time_aware + timedelta(days=5)
         
@@ -222,14 +221,23 @@ def task_fill_orders():
             local_p, usd_p = get_fill_data(t.ticker, market, t.date)
             
             if usd_p and usd_p > 0:
-                qty = t.amount / usd_p
+                # --- MODIFIED EXECUTION LOGIC ---
+                # Use the Quantity the Analyst requested.
+                # Recalculate the USD Amount based on execution price.
+                qty = t.quantity
+                if not qty or qty <= 0:
+                    # Fallback if quantity wasn't saved correctly (backward compatibility)
+                    qty = t.amount / usd_p if t.amount else 0
+                
+                final_amount = qty * usd_p
                 
                 t.price = usd_p
                 t.local_price = local_p
                 t.quantity = qty
+                t.amount = final_amount # Update with actual filled value
                 t.status = 'FILLED'
                 
-                logger.info(f"FILLED: {t.ticker} @ ${usd_p:.2f} USD")
+                logger.info(f"FILLED: {t.ticker} | Qty: {qty} | Price: ${usd_p:.2f} | Amt: ${final_amount:.0f}")
             else:
                 pass # Already logged waiting message
                 
