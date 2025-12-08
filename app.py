@@ -848,7 +848,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
             * **Longs:** Position: 10% - 40% of Equity. Total Longs: Min 90% - Max 100% of Equity. Max 5 Names.
             * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: Max 50% of Equity. Max 3 Names.
             * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
-            * **Frequency:** Maximum 1 trade per stock per 5 trading days.
+            * **Frequency:** Cannot repeat an unwind trade (Sell/Cover) on the same stock within 5 days. Entries are allowed.
             * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
             """)
 
@@ -983,18 +983,24 @@ def analyst_page(user, session_obj, is_pm_view=False):
                          w = "Total Short Exposure below 30%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
-                # 3. FREQUENCY LIMIT (Max 1 trade per week)
-                # Check for recent filled trades of this ticker
-                check_start_date = eval_date - timedelta(days=5) # 5 calendar days as proxy for trading week
-                recent_trades = session_obj.query(Transaction).filter(
-                    Transaction.user_id == user.id,
-                    Transaction.ticker == final_tik,
-                    Transaction.status == 'FILLED',
-                    Transaction.date >= check_start_date
-                ).count()
+                # 3. FREQUENCY LIMIT (Modified: Block repeated unwinds only)
+                # "I have sold long positions in the last five days and so I cannot sell within that 5 days, but I can still buy."
+                # Logic: Only block if Current Order is an Unwind (SELL/COVER) AND we successfully Unwound (SELL/COVER) in the last 5 days.
                 
-                if recent_trades > 0:
-                    error_msg = f"Compliance Violation: Frequency Limit. You have traded {final_tik} in the last 5 days."
+                if side in ['SELL', 'BUY_TO_COVER']:
+                    check_start_date = eval_date - timedelta(days=5)
+                    
+                    # specific check: Has a trade of the SAME TYPE (unwind) happened recently?
+                    recent_unwinds = session_obj.query(Transaction).filter(
+                        Transaction.user_id == user.id,
+                        Transaction.ticker == final_tik,
+                        Transaction.status == 'FILLED',
+                        Transaction.trans_type == side, # Checking if we did THIS specific action recently
+                        Transaction.date >= check_start_date
+                    ).count()
+                    
+                    if recent_unwinds > 0:
+                        error_msg = f"Compliance Violation: Unwind Frequency. You have already executed a {side} on {final_tik} in the last 5 days. Repeated unwinding is not permitted."
 
                 # 4. LOCKUP (Existing logic remains valid for closing trades)
                 if side in ['SELL', 'BUY_TO_COVER']:
