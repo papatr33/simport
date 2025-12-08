@@ -592,9 +592,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
     col_top, col_refresh = st.columns([6,1])
     with col_top:
         if not is_pm_view:
-            st.markdown(f"## 🚀 Welcome, {user.username}")
+            st.markdown(f"## 🚀 Welcome, {user.username} ({user.role.capitalize()})")
         else:
-            st.markdown(f"### Viewing Analyst: {user.username}")
+            st.markdown(f"### Viewing: {user.username}")
     with col_refresh:
         if st.button("🔄 Refresh Data", key=f"refresh_{user.id}"):
             st.cache_data.clear()
@@ -844,13 +844,16 @@ def analyst_page(user, session_obj, is_pm_view=False):
         st.subheader("⚡ Execute Trade")
         
         with st.expander("Compliance Rules Summary"):
-            st.markdown("""
-            * **Longs:** Position: 10% - 40% of Equity. Total Longs: Min 90% - Max 100% of Equity. Max 5 Names.
-            * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: Max 50% of Equity. Max 3 Names.
-            * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
-            * **Frequency:** Cannot repeat an unwind trade (Sell/Cover) on the same stock within 5 days. Entries are allowed.
-            * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
-            """)
+            if user.role == 'trader':
+                st.info("ℹ️ **Trader Mode Active**: Compliance rules (position limits, frequency checks, lockups) are bypassed.")
+            else:
+                st.markdown("""
+                * **Longs:** Position: 10% - 40% of Equity. Total Longs: Min 90% - Max 100% of Equity. Max 5 Names.
+                * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: Max 50% of Equity. Max 3 Names.
+                * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
+                * **Frequency:** Cannot repeat an unwind trade (Sell/Cover) on the same stock within 5 days. Entries are allowed.
+                * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
+                """)
 
         with st.form("order_form", clear_on_submit=True):
             col_a, col_b, col_c, col_d = st.columns(4)
@@ -888,141 +891,141 @@ def analyst_page(user, session_obj, is_pm_view=False):
                 error_msg = None
                 warning_msg = None
                 
-                current_longs = {t: p for t, p in state['positions'].items() if p['type'] == 'LONG'}
-                current_shorts = {t: p for t, p in state['positions'].items() if p['type'] == 'SHORT'}
-                current_pos = state['positions'].get(final_tik)
-                
-                est_amount = qty_input * est_usd_p
-                
-                # Simulate Equity (Assume Cash Swap = No Immediate Equity Change)
-                sim_equity = state['equity'] 
-                
-                # Simulate Positions
-                sim_longs = current_longs.copy()
-                sim_shorts = current_shorts.copy()
-                
-                # Update specific position
-                if side == 'BUY':
-                    if final_tik in sim_longs:
-                        old_val = sim_longs[final_tik]['mkt_val']
-                        sim_longs[final_tik] = {'mkt_val': old_val + est_amount} # Simply update val
-                    else:
-                        sim_longs[final_tik] = {'mkt_val': est_amount}
-                        
-                elif side == 'SELL':
-                    if final_tik in sim_longs:
-                        old_val = sim_longs[final_tik]['mkt_val']
-                        new_val = old_val - est_amount
-                        if new_val < 100: # Assuming closed
-                            del sim_longs[final_tik]
+                # --- TRADER ROLE BYPASS LOGIC ---
+                if user.role != 'trader':
+                    current_longs = {t: p for t, p in state['positions'].items() if p['type'] == 'LONG'}
+                    current_shorts = {t: p for t, p in state['positions'].items() if p['type'] == 'SHORT'}
+                    current_pos = state['positions'].get(final_tik)
+                    
+                    est_amount = qty_input * est_usd_p
+                    
+                    # Simulate Equity (Assume Cash Swap = No Immediate Equity Change)
+                    sim_equity = state['equity'] 
+                    
+                    # Simulate Positions
+                    sim_longs = current_longs.copy()
+                    sim_shorts = current_shorts.copy()
+                    
+                    # Update specific position
+                    if side == 'BUY':
+                        if final_tik in sim_longs:
+                            old_val = sim_longs[final_tik]['mkt_val']
+                            sim_longs[final_tik] = {'mkt_val': old_val + est_amount} # Simply update val
                         else:
-                            sim_longs[final_tik] = {'mkt_val': new_val}
+                            sim_longs[final_tik] = {'mkt_val': est_amount}
+                            
+                    elif side == 'SELL':
+                        if final_tik in sim_longs:
+                            old_val = sim_longs[final_tik]['mkt_val']
+                            new_val = old_val - est_amount
+                            if new_val < 100: # Assuming closed
+                                del sim_longs[final_tik]
+                            else:
+                                sim_longs[final_tik] = {'mkt_val': new_val}
 
-                elif side == 'SHORT_SELL':
-                    if final_tik in sim_shorts:
-                        old_val = sim_shorts[final_tik]['mkt_val']
-                        sim_shorts[final_tik] = {'mkt_val': old_val + est_amount}
-                    else:
-                        sim_shorts[final_tik] = {'mkt_val': est_amount}
-                
-                elif side == 'BUY_TO_COVER':
-                    if final_tik in sim_shorts:
-                        old_val = sim_shorts[final_tik]['mkt_val']
-                        new_val = old_val - est_amount
-                        if new_val < 100:
-                            del sim_shorts[final_tik]
+                    elif side == 'SHORT_SELL':
+                        if final_tik in sim_shorts:
+                            old_val = sim_shorts[final_tik]['mkt_val']
+                            sim_shorts[final_tik] = {'mkt_val': old_val + est_amount}
                         else:
-                            sim_shorts[final_tik] = {'mkt_val': new_val}
+                            sim_shorts[final_tik] = {'mkt_val': est_amount}
+                    
+                    elif side == 'BUY_TO_COVER':
+                        if final_tik in sim_shorts:
+                            old_val = sim_shorts[final_tik]['mkt_val']
+                            new_val = old_val - est_amount
+                            if new_val < 100:
+                                del sim_shorts[final_tik]
+                            else:
+                                sim_shorts[final_tik] = {'mkt_val': new_val}
 
-                # --- CHECK RULES ON SIMULATED STATE ---
-                sim_long_total = sum(p['mkt_val'] for p in sim_longs.values())
-                sim_short_total = sum(p['mkt_val'] for p in sim_shorts.values())
+                    # --- CHECK RULES ON SIMULATED STATE ---
+                    sim_long_total = sum(p['mkt_val'] for p in sim_longs.values())
+                    sim_short_total = sum(p['mkt_val'] for p in sim_shorts.values())
 
-                # 1. LONG RULES (BUY or SELL/TRIM)
-                if side in ['BUY', 'SELL']:
-                    if len(sim_longs) > 5:
-                        error_msg = f"Compliance Violation: Max 5 Long positions allowed (Projected: {len(sim_longs)})."
-                    
-                    # Check SIZE of THIS position (if it still exists/wasn't closed)
-                    if final_tik in sim_longs:
-                        this_val = sim_longs[final_tik]['mkt_val']
-                        pct = (this_val / sim_equity) * 100
-                        if not (10.0 <= pct <= 40.0):
-                            if pct > 40.0: 
-                                error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% exceeds max limit (40%)."
-                            elif pct < 10.0: 
-                                error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% is below min limit (10%)."
-                    
-                    # Total Long Exposure Checks
-                    long_exp_pct = (sim_long_total / sim_equity) * 100
-                    if long_exp_pct < 90.0:
-                         w = f"Total Long Exposure {long_exp_pct:.1f}% below target 90%."
-                         warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
-                    
-                    if long_exp_pct > 100.0:
-                        error_msg = f"Compliance Violation: Total Long Exposure {long_exp_pct:.1f}% exceeds max limit (100%)."
-
-                # 2. SHORT RULES (SHORT_SELL or COVER/TRIM)
-                if side in ['SHORT_SELL', 'BUY_TO_COVER']:
-                    if len(sim_shorts) > 3:
-                        error_msg = f"Compliance Violation: Max 3 Short positions allowed (Projected: {len(sim_shorts)})."
-                    
-                    if final_tik in sim_shorts:
-                        this_val = sim_shorts[final_tik]['mkt_val']
-                        pct = (this_val / sim_equity) * 100
-                        if not (10.0 <= pct <= 30.0):
-                             if pct > 30.0: 
-                                 error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% exceeds max limit (30%)."
-                             elif pct < 10.0: 
-                                 error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% is below min limit (10%)."
-                    
-                    total_pct = (sim_short_total / sim_equity) * 100
-                    if total_pct > 50.0:
-                        error_msg = f"Compliance Violation: Total Short Exposure {total_pct:.1f}% exceeds max limit (50%)."
-                    elif total_pct < 30.0:
-                         w = "Total Short Exposure below 30%."
-                         warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
-
-                # 3. FREQUENCY LIMIT (Modified: Block repeated unwinds only)
-                # "I have sold long positions in the last five days and so I cannot sell within that 5 days, but I can still buy."
-                # Logic: Only block if Current Order is an Unwind (SELL/COVER) AND we successfully Unwound (SELL/COVER) in the last 5 days.
-                
-                if side in ['SELL', 'BUY_TO_COVER']:
-                    check_start_date = eval_date - timedelta(days=5)
-                    
-                    # specific check: Has a trade of the SAME TYPE (unwind) happened recently?
-                    recent_unwinds = session_obj.query(Transaction).filter(
-                        Transaction.user_id == user.id,
-                        Transaction.ticker == final_tik,
-                        Transaction.status == 'FILLED',
-                        Transaction.trans_type == side, # Checking if we did THIS specific action recently
-                        Transaction.date >= check_start_date
-                    ).count()
-                    
-                    if recent_unwinds > 0:
-                        error_msg = f"Compliance Violation: Unwind Frequency. You have already executed a {side} on {final_tik} in the last 5 days. Repeated unwinding is not permitted."
-
-                # 4. LOCKUP (Existing logic remains valid for closing trades)
-                if side in ['SELL', 'BUY_TO_COVER']:
-                    curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
-                    if not current_pos:
-                         error_msg = "Cannot close a position you don't hold."
-                    else:
-                        days_held = (curr_date - current_pos['first_entry']).days
-                        lockup_days = 2
-                        is_violation = days_held < lockup_days
+                    # 1. LONG RULES (BUY or SELL/TRIM)
+                    if side in ['BUY', 'SELL']:
+                        if len(sim_longs) > 5:
+                            error_msg = f"Compliance Violation: Max 5 Long positions allowed (Projected: {len(sim_longs)})."
                         
-                        if is_violation and side == 'BUY_TO_COVER':
-                            entry_p = current_pos['avg_cost']
-                            curr_p = est_usd_p
-                            pnl_pct = (entry_p - curr_p) / entry_p
-                            if pnl_pct > 0.15 or pnl_pct < -0.20:
-                                is_violation = False
-                                warning_msg = f"⚠️ Lockup bypassed due to PnL trigger ({pnl_pct*100:.1f}%)."
+                        # Check SIZE of THIS position (if it still exists/wasn't closed)
+                        if final_tik in sim_longs:
+                            this_val = sim_longs[final_tik]['mkt_val']
+                            pct = (this_val / sim_equity) * 100
+                            if not (10.0 <= pct <= 40.0):
+                                if pct > 40.0: 
+                                    error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% exceeds max limit (40%)."
+                                elif pct < 10.0: 
+                                    error_msg = f"Compliance Violation: Projected Long Position {pct:.1f}% is below min limit (10%)."
                         
-                        if is_violation:
-                             error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding {lockup_days} days."
+                        # Total Long Exposure Checks
+                        long_exp_pct = (sim_long_total / sim_equity) * 100
+                        if long_exp_pct < 90.0:
+                             w = f"Total Long Exposure {long_exp_pct:.1f}% below target 90%."
+                             warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
+                        
+                        if long_exp_pct > 100.0:
+                            error_msg = f"Compliance Violation: Total Long Exposure {long_exp_pct:.1f}% exceeds max limit (100%)."
 
+                    # 2. SHORT RULES (SHORT_SELL or COVER/TRIM)
+                    if side in ['SHORT_SELL', 'BUY_TO_COVER']:
+                        if len(sim_shorts) > 3:
+                            error_msg = f"Compliance Violation: Max 3 Short positions allowed (Projected: {len(sim_shorts)})."
+                        
+                        if final_tik in sim_shorts:
+                            this_val = sim_shorts[final_tik]['mkt_val']
+                            pct = (this_val / sim_equity) * 100
+                            if not (10.0 <= pct <= 30.0):
+                                 if pct > 30.0: 
+                                     error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% exceeds max limit (30%)."
+                                 elif pct < 10.0: 
+                                     error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% is below min limit (10%)."
+                        
+                        total_pct = (sim_short_total / sim_equity) * 100
+                        if total_pct > 50.0:
+                            error_msg = f"Compliance Violation: Total Short Exposure {total_pct:.1f}% exceeds max limit (50%)."
+                        elif total_pct < 30.0:
+                             w = "Total Short Exposure below 30%."
+                             warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
+
+                    # 3. FREQUENCY LIMIT (Modified: Block repeated unwinds only)
+                    if side in ['SELL', 'BUY_TO_COVER']:
+                        check_start_date = eval_date - timedelta(days=5)
+                        recent_unwinds = session_obj.query(Transaction).filter(
+                            Transaction.user_id == user.id,
+                            Transaction.ticker == final_tik,
+                            Transaction.status == 'FILLED',
+                            Transaction.trans_type == side,
+                            Transaction.date >= check_start_date
+                        ).count()
+                        
+                        if recent_unwinds > 0:
+                            error_msg = f"Compliance Violation: Unwind Frequency. You have already executed a {side} on {final_tik} in the last 5 days. Repeated unwinding is not permitted."
+
+                    # 4. LOCKUP (Existing logic remains valid for closing trades)
+                    if side in ['SELL', 'BUY_TO_COVER']:
+                        curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
+                        if not current_pos:
+                             error_msg = "Cannot close a position you don't hold."
+                        else:
+                            days_held = (curr_date - current_pos['first_entry']).days
+                            is_violation = days_held < 30
+                            
+                            if is_violation and side == 'BUY_TO_COVER':
+                                entry_p = current_pos['avg_cost']
+                                curr_p = est_usd_p
+                                pnl_pct = (entry_p - curr_p) / entry_p
+                                if pnl_pct > 0.15 or pnl_pct < -0.20:
+                                    is_violation = False
+                                    warning_msg = f"⚠️ Lockup bypassed due to PnL trigger ({pnl_pct*100:.1f}%)."
+                            
+                            if is_violation:
+                                 error_msg = f"Compliance Violation: Position held for {days_held} days. Min holding 30 days."
+                else:
+                    # Trader Role: Bypass all checks
+                    warning_msg = "⚠️ Trader Role: Compliance checks bypassed."
+                    est_amount = qty_input * est_usd_p
+                    
                 if error_msg:
                     st.error(error_msg)
                 else:
@@ -1063,9 +1066,10 @@ def pm_page(user, session_obj):
             st.cache_data.clear()
             st.rerun()
     
-    analysts = session_obj.query(User).filter_by(role='analyst').all()
+    # MODIFIED: Include both Analysts and Traders in PM view
+    analysts = session_obj.query(User).filter(User.role.in_(['analyst', 'trader'])).all()
     if not analysts:
-        st.warning("No analysts found.")
+        st.warning("No analysts or traders found.")
         return
 
     summary = []
@@ -1090,7 +1094,8 @@ def pm_page(user, session_obj):
         net_exp_pct = ((long_exp - short_exp) / s['equity']) * 100
         
         summary.append({
-            "Analyst": a.username, 
+            "Analyst": a.username,
+            "Role": a.role.capitalize(), # Show role in table
             "Equity": s['equity'], 
             "Cash %": (s['cash'] / s['equity']) * 100,
             "Gross Exp": gross_exp_pct,
@@ -1192,7 +1197,8 @@ def admin_page(session_obj):
         with st.form("new_user"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            r = st.selectbox("Role", ["analyst", "pm"])
+            # MODIFIED: Added 'trader' to role selection
+            r = st.selectbox("Role", ["analyst", "pm", "trader"])
             if st.form_submit_button("Create Account"):
                 if session_obj.query(User).filter_by(username=u).first():
                     st.error("Username exists")
@@ -1262,6 +1268,9 @@ def main():
         if user.role == 'admin':
             admin_page(session)
         elif user.role == 'analyst':
+            analyst_page(user, session)
+        elif user.role == 'trader':
+            # Traders use the analyst page but bypass compliance
             analyst_page(user, session)
         elif user.role == 'pm':
             pm_page(user, session)
