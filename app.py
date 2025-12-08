@@ -588,11 +588,18 @@ def render_monthly_breakdown(df_curve, initial_capital):
     return pd.DataFrame()
 
 def analyst_page(user, session_obj, is_pm_view=False):
-    if not is_pm_view:
-        st.markdown(f"## 🚀 Welcome, {user.username}")
-    else:
-        st.markdown(f"### Viewing Analyst: {user.username}")
-    
+    # --- ADDED: Refresh Button ---
+    col_top, col_refresh = st.columns([6,1])
+    with col_top:
+        if not is_pm_view:
+            st.markdown(f"## 🚀 Welcome, {user.username}")
+        else:
+            st.markdown(f"### Viewing Analyst: {user.username}")
+    with col_refresh:
+        if st.button("🔄 Refresh Data", key=f"refresh_{user.id}"):
+            st.cache_data.clear()
+            st.rerun()
+
     txs_data = fetch_user_transactions(user.id, session_obj)
     state = calculate_portfolio_state_cached(txs_data, user.initial_capital)
     
@@ -703,45 +710,44 @@ def analyst_page(user, session_obj, is_pm_view=False):
             st.info("No active positions.")
 
     with t4:
-            st.subheader("Queued (Pending) Orders")
-            # Query database directly for pending orders
-            pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
+        st.subheader("Queued (Pending) Orders")
+        # Query database directly for pending orders
+        pending_txs = session_obj.query(Transaction).filter_by(user_id=user.id, status='PENDING').order_by(Transaction.date).all()
+        
+        if pending_txs:
+            # Table View
+            p_data = []
+            for pt in pending_txs:
+                p_data.append({
+                    "ID": pt.id,
+                    "Date": pt.date.strftime('%Y-%m-%d %H:%M'),
+                    "Market": pt.market,
+                    "Type": pt.trans_type,
+                    "Ticker": pt.ticker,
+                    "Shares": f"{pt.quantity:,.0f}",
+                    "Est. Amount ($)": f"${pt.amount:,.0f}"
+                })
             
-            if pending_txs:
-                # --- MODIFICATION: Use st.table for display ---
-                p_data = []
-                for pt in pending_txs:
-                    p_data.append({
-                        "ID": pt.id,
-                        "Date": pt.date.strftime('%Y-%m-%d %H:%M'),
-                        "Market": pt.market,
-                        "Type": pt.trans_type,
-                        "Ticker": pt.ticker,
-                        "Est. Amount ($)": f"${pt.amount:,.0f}"
-                    })
-                
-                # Display readable table
-                st.table(pd.DataFrame(p_data))
-                
-                # Deletion UI (Required because st.table is not interactive)
-                if not is_pm_view:
-                    st.caption("Select an Order ID to cancel:")
-                    col_del_1, col_del_2 = st.columns([3, 1])
-                    with col_del_1:
-                        to_delete = st.selectbox("Order ID", options=[p["ID"] for p in p_data], label_visibility="collapsed")
-                    with col_del_2:
-                        if st.button("Cancel Order", type="primary"):
-                            if to_delete:
-                                t_to_del = session_obj.query(Transaction).filter_by(id=to_delete).first()
-                                if t_to_del:
-                                    session_obj.delete(t_to_del)
-                                    session_obj.commit()
-                                    st.success(f"Order {to_delete} cancelled.")
-                                    time.sleep(1); st.rerun()
-                
-                st.caption("Orders will be picked up by the execution engine shortly.")
-            else:
-                st.info("No pending orders in queue.")
+            st.table(pd.DataFrame(p_data))
+            
+            if not is_pm_view:
+                st.caption("Select an Order ID to cancel:")
+                col_del_1, col_del_2 = st.columns([3, 1])
+                with col_del_1:
+                    to_delete = st.selectbox("Order ID", options=[p["ID"] for p in p_data], label_visibility="collapsed")
+                with col_del_2:
+                    if st.button("Cancel Order", type="primary"):
+                        if to_delete:
+                            t_to_del = session_obj.query(Transaction).filter_by(id=to_delete).first()
+                            if t_to_del:
+                                session_obj.delete(t_to_del)
+                                session_obj.commit()
+                                st.success(f"Order {to_delete} cancelled.")
+                                time.sleep(1); st.rerun()
+            
+            st.caption("Orders will be picked up by the execution engine shortly.")
+        else:
+            st.info("No pending orders in queue.")
 
     with t5:
         st.subheader("All Traded Positions (Historical)")
@@ -842,6 +848,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
             * **Longs:** Position: 10% - 40% of Equity. Total Longs: Min 90% - Max 100% of Equity. Max 5 Names.
             * **Shorts:** Position: 10% - 30% of Equity. Total Shorts: Max 50% of Equity. Max 3 Names.
             * **Lockup:** 30 Days. *Exception: Profit > 15% or Loss > 20% on Shorts.*
+            * **Frequency:** Maximum 1 trade per stock per 5 trading days.
             * **Execution:** Trades placed during market hours (plus delay) execute near current price. Trades placed *after* market close will execute at the next trading day's available price.
             """)
 
@@ -952,7 +959,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
                          w = f"Total Long Exposure {long_exp_pct:.1f}% below target 90%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
                     
-                    # ADDED: Max Total Long Check (e.g. 100%)
                     if long_exp_pct > 100.0:
                         error_msg = f"Compliance Violation: Total Long Exposure {long_exp_pct:.1f}% exceeds max limit (100%)."
 
@@ -970,7 +976,6 @@ def analyst_page(user, session_obj, is_pm_view=False):
                              elif pct < 10.0: 
                                  error_msg = f"Compliance Violation: Projected Short Position {pct:.1f}% is below min limit (10%)."
                     
-                    # STRICT: Total Short Max Check
                     total_pct = (sim_short_total / sim_equity) * 100
                     if total_pct > 50.0:
                         error_msg = f"Compliance Violation: Total Short Exposure {total_pct:.1f}% exceeds max limit (50%)."
@@ -978,7 +983,20 @@ def analyst_page(user, session_obj, is_pm_view=False):
                          w = "Total Short Exposure below 30%."
                          warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
-                # 3. LOCKUP (Existing logic remains valid for closing trades)
+                # 3. FREQUENCY LIMIT (Max 1 trade per week)
+                # Check for recent filled trades of this ticker
+                check_start_date = eval_date - timedelta(days=5) # 5 calendar days as proxy for trading week
+                recent_trades = session_obj.query(Transaction).filter(
+                    Transaction.user_id == user.id,
+                    Transaction.ticker == final_tik,
+                    Transaction.status == 'FILLED',
+                    Transaction.date >= check_start_date
+                ).count()
+                
+                if recent_trades > 0:
+                    error_msg = f"Compliance Violation: Frequency Limit. You have traded {final_tik} in the last 5 days."
+
+                # 4. LOCKUP (Existing logic remains valid for closing trades)
                 if side in ['SELL', 'BUY_TO_COVER']:
                     curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
                     if not current_pos:
@@ -1029,7 +1047,14 @@ def analyst_page(user, session_obj, is_pm_view=False):
                         time.sleep(1); st.rerun()
 
 def pm_page(user, session_obj):
-    st.title("👨‍💼 Portfolio Manager Dashboard")
+    # --- ADDED: Refresh Button ---
+    col_top, col_refresh = st.columns([6,1])
+    with col_top:
+        st.title("👨‍💼 Portfolio Manager Dashboard")
+    with col_refresh:
+        if st.button("🔄 Refresh Data", key="pm_refresh"):
+            st.cache_data.clear()
+            st.rerun()
     
     analysts = session_obj.query(User).filter_by(role='analyst').all()
     if not analysts:
