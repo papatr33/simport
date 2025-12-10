@@ -1061,7 +1061,7 @@ def pm_page(user, session_obj):
     # --- ADDED: Refresh Button ---
     col_top, col_refresh = st.columns([6,1])
     with col_top:
-        st.title("👨‍💼 Portfolio Manager Dashboard")
+        st.title("📖 Portfolio Manager Dashboard")
     with col_refresh:
         if st.button("🔄 Refresh Data", key="pm_refresh"):
             st.cache_data.clear()
@@ -1280,4 +1280,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
