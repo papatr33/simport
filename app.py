@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, date
 import time
 import numpy as np
 
+from core_logic import calculate_portfolio_state, get_ytd_performance, fetch_batch_data, extract_scalar, MARKET_CONFIG
+
 # ==========================================
 # 1. CONFIGURATION & STYLING
 # ==========================================
@@ -35,16 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-MARKET_CONFIG = {
-    "US": {"suffix": "", "fx": None, "currency": "USD"},
-    "Hong Kong": {"suffix": ".HK", "fx": "HKD=X", "currency": "HKD"},
-    "China (Shanghai)": {"suffix": ".SS", "fx": "CNY=X", "currency": "CNY"},
-    "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY"},
-    "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
-    "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"}, 
-    "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"},
-    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR"}
-}
+
 
 # ==========================================
 # 2. DATABASE SETUP
@@ -114,30 +107,22 @@ Session = sessionmaker(bind=engine)
 # 3. DATA ENGINE (OPTIMIZED)
 # ==========================================
 
-def extract_scalar(val):
-    try:
-        if isinstance(val, (pd.Series, pd.DataFrame, np.ndarray, list)):
-            val = val.values.flatten()[0] if hasattr(val, 'values') else val[0]
-        return float(val)
-    except: return 0.0
+
 
 @st.cache_data(ttl=600) 
-def fetch_batch_data(tickers, start_date):
-    if not tickers: return pd.DataFrame()
-    tickers = list(set(tickers))
-    try:
-        # Buffer start date
-        data = yf.download(tickers, start=start_date - timedelta(days=7), progress=False)['Close']
-        if isinstance(data, pd.Series): data = data.to_frame(name=tickers[0])
-        elif data.empty: return pd.DataFrame()
-        
-        # Ensure DateTime Index
-        if not isinstance(data.index, pd.DatetimeIndex):
-            data.index = pd.to_datetime(data.index)
-        data.index = data.index.normalize()
-        
-        return data.ffill()
-    except: return pd.DataFrame()
+# Wrappers to maintain Streamlit Caching
+def fetch_batch_data_cached(tickers, start_date):
+    return fetch_batch_data(tickers, start_date)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def calculate_portfolio_state_cached(txs_data, initial_capital):
+    return calculate_portfolio_state(txs_data, initial_capital)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ytd_performance_cached(txs_data, initial_capital):
+    return get_ytd_performance(txs_data, initial_capital)
+
+
 
 def get_historical_price(ticker, date_obj, market):
     # This is only used for new order entry/validation
@@ -1280,5 +1265,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
