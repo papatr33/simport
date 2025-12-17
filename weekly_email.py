@@ -83,7 +83,7 @@ def run_weekly_report():
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    analysts = session.query(User).filter(User.role.in_(['analyst', 'trader', 'pm'])).all()
+    analysts = session.query(User).filter(User.role.in_(['analyst', 'trader'])).all()
     
     email_body = "<html><body><h2>Weekly Portfolio Report</h2>"
     
