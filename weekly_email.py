@@ -58,47 +58,34 @@ def fetch_user_transactions(session, user_id):
         'local_price': t.local_price, 'price': t.price
     } for t in txs]
 
-# --- NEW: Horizontal Monthly Table Logic ---
 def generate_monthly_html(df_curve, initial_capital):
     if df_curve.empty: return "<p>No data</p>"
     
-    # Ensure date column is datetime
     df_curve['Date'] = pd.to_datetime(df_curve['Date'])
     df_curve['Month'] = df_curve['Date'].dt.to_period('M')
     
-    stats = {} # Key: Month Period, Value: {Long, Short, Total}
-    
+    stats = {} 
     prev_equity = initial_capital
     
-    # Group by month to calculate attribution
     for month, group in df_curve.groupby('Month'):
         month_end_equity = group['Equity'].iloc[-1]
         if prev_equity == 0: prev_equity = initial_capital 
         
-        # Sum daily PnL for the month
         long_pnl_sum = group['Long PnL'].sum()
         short_pnl_sum = group['Short PnL'].sum()
         
-        # Calculate Returns relative to Month Start Equity
         long_ret = (long_pnl_sum / prev_equity) * 100
         short_ret = (short_pnl_sum / prev_equity) * 100
         total_ret = ((month_end_equity - prev_equity) / prev_equity) * 100
         
-        stats[month] = {
-            "Long": long_ret,
-            "Short": short_ret,
-            "Total": total_ret
-        }
-        prev_equity = month_end_equity # Update for next loop
+        stats[month] = {"Long": long_ret, "Short": short_ret, "Total": total_ret}
+        prev_equity = month_end_equity
 
     if not stats: return "<p>No data</p>"
 
-    # Build Horizontal Table HTML
     months = list(stats.keys())
-    # Format Month Header (e.g., "Jan", "Feb")
     month_headers = "".join([f"<th style='padding: 8px; text-align: center;'>{m.strftime('%b')}</th>" for m in months])
     
-    # Generate Data Rows
     long_cells = "".join([f"<td style='padding: 8px; text-align: center; color: {'#10B981' if stats[m]['Long'] >= 0 else '#EF4444'};'>{stats[m]['Long']:+.2f}%</td>" for m in months])
     short_cells = "".join([f"<td style='padding: 8px; text-align: center; color: {'#10B981' if stats[m]['Short'] >= 0 else '#EF4444'};'>{stats[m]['Short']:+.2f}%</td>" for m in months])
     total_cells = "".join([f"<td style='padding: 8px; text-align: center; font-weight: bold; color: {'#10B981' if stats[m]['Total'] >= 0 else '#EF4444'};'>{stats[m]['Total']:+.2f}%</td>" for m in months])
@@ -125,12 +112,62 @@ def generate_monthly_html(df_curve, initial_capital):
     """
     return html
 
+# --- NEW HELPER: Generate Current Holdings HTML ---
+def generate_holdings_html(state):
+    positions = state.get('positions', {})
+    if not positions:
+        return "<p>No active positions.</p>"
+
+    rows = ""
+    for tik, pos in positions.items():
+        # 1. Entry Date
+        entry_date = pos.get('first_entry')
+        date_str = entry_date.strftime('%Y-%m-%d') if entry_date else "-"
+        
+        # 2. Type
+        p_type = pos.get('type', 'FLAT')
+        
+        # 3. Size (as % of Equity)
+        equity = state.get('equity', 1)
+        mkt_val = pos.get('mkt_val', 0)
+        size_pct = (mkt_val / equity) * 100 if equity > 0 else 0
+        
+        # 4. Return %
+        # Return on Invested Capital for this specific position
+        invested = abs(pos.get('qty', 0) * pos.get('avg_cost', 0))
+        unrealized = pos.get('unrealized', 0)
+        ret_pct = (unrealized / invested) * 100 if invested > 0 else 0.0
+        
+        color = '#10B981' if ret_pct >= 0 else '#EF4444'
+
+        rows += f"""
+        <tr>
+            <td style='padding: 8px;'>{tik}</td>
+            <td style='padding: 8px; text-align: center;'>{date_str}</td>
+            <td style='padding: 8px; text-align: center;'>{p_type}</td>
+            <td style='padding: 8px; text-align: right;'>{size_pct:.1f}%</td>
+            <td style='padding: 8px; text-align: right; color: {color}; font-weight: bold;'>{ret_pct:+.2f}%</td>
+        </tr>
+        """
+
+    return f"""
+    <table border='1' cellpadding='0' cellspacing='0' style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 14px;'>
+        <tr style='background-color: #f2f2f2;'>
+            <th style='padding: 8px; text-align: left;'>Ticker</th>
+            <th style='padding: 8px; text-align: center;'>Entry Date</th>
+            <th style='padding: 8px; text-align: center;'>Type</th>
+            <th style='padding: 8px; text-align: right;'>Size</th>
+            <th style='padding: 8px; text-align: right;'>Return %</th>
+        </tr>
+        {rows}
+    </table>
+    """
+
 def run_weekly_report():
     engine = get_engine()
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # Filter: Analysts and Traders only (No PM)
     analysts = session.query(User).filter(User.role.in_(['analyst', 'trader'])).all()
     
     email_body = "<html><body style='font-family: Arial, sans-serif;'>"
@@ -148,12 +185,16 @@ def run_weekly_report():
         state_now = calculate_portfolio_state(txs, user.initial_capital, now)
         state_prev = calculate_portfolio_state(txs, user.initial_capital, two_weeks_ago)
         
-        # 2. Monthly Returns (Horizontal Table)
+        # --- NEW SECTION 1: Current Holdings ---
+        email_body += "<h4>Current Holdings</h4>"
+        email_body += generate_holdings_html(state_now)
+        
+        # --- SECTION 2: Monthly Returns ---
         df_curve, _ = get_ytd_performance(txs, user.initial_capital)
         email_body += "<h4>Monthly Returns Breakdown</h4>"
         email_body += generate_monthly_html(df_curve, user.initial_capital)
 
-        # 3. Position Changes (Now vs 2 Weeks Ago)
+        # --- SECTION 3: Position Changes ---
         email_body += "<h4>Position Changes (Last 14 Days)</h4>"
         email_body += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%; font-size: 14px;'>"
         email_body += "<tr style='background-color: #f2f2f2;'><th style='text-align: left;'>Ticker</th><th style='text-align: center;'>Type</th><th style='text-align: right;'>Change</th></tr>"
@@ -161,7 +202,7 @@ def run_weekly_report():
         all_tickers = set(list(state_now['positions'].keys()) + list(state_prev['positions'].keys()))
         
         has_changes = False
-        for tik in sorted(list(all_tickers)): # Sorted for neatness
+        for tik in sorted(list(all_tickers)):
             # Get Prev Stats
             p_prev = state_prev['positions'].get(tik, {})
             val_prev = p_prev.get('mkt_val', 0)
@@ -174,13 +215,11 @@ def run_weekly_report():
             equity_curr = state_now['equity'] if state_now['equity'] > 0 else 1
             pct_curr = (val_curr / equity_curr) * 100
             
-            # Formatting logic
             side = p_curr.get('type') or p_prev.get('type') or "FLAT"
             
-            # Filter: Show if position existed in either period
             if abs(pct_curr) > 0.01 or abs(pct_prev) > 0.01:
                 has_changes = True
-                arrow = "&nbsp;" # default space
+                arrow = "&nbsp;" 
                 if pct_curr > pct_prev + 0.1: arrow = "<span style='color: green;'>⬆️</span>"
                 elif pct_curr < pct_prev - 0.1: arrow = "<span style='color: red;'>⬇️</span>"
                 
@@ -200,7 +239,6 @@ def run_weekly_report():
 
     email_body += "</body></html>"
 
-    # SEND EMAIL
     sender_email = os.environ.get("EMAIL_SENDER")
     sender_pass = os.environ.get("EMAIL_PASSWORD")
     receiver_email = os.environ.get("EMAIL_RECEIVER")
