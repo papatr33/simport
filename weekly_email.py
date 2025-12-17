@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from datetime import datetime, timedelta
 import pandas as pd
 import toml
+import yfinance as yf # Added for name fetching
 
 # Import shared logic
 from core_logic import calculate_portfolio_state, get_ytd_performance
@@ -57,6 +58,33 @@ def fetch_user_transactions(session, user_id):
         'date': t.date, 'amount': t.amount, 'quantity': t.quantity,
         'local_price': t.local_price, 'price': t.price
     } for t in txs]
+
+# --- NEW: Name Fetching Helper ---
+NAME_CACHE = {}
+
+def get_stock_name(ticker):
+    """Fetches stock name from yfinance with caching."""
+    if ticker in NAME_CACHE:
+        return NAME_CACHE[ticker]
+    
+    try:
+        # Ticker object
+        t = yf.Ticker(ticker)
+        # Try long name, then short name, then fallback to ticker
+        # We use a fast timeout or just rely on standard fetch. 
+        # Note: .info can be slow, but for a weekly report it's acceptable.
+        info = t.info
+        name = info.get('longName') or info.get('shortName') or ticker
+        
+        # Shorten very long names for email readability
+        if len(name) > 30:
+            name = name[:27] + "..."
+            
+        NAME_CACHE[ticker] = name
+        return name
+    except Exception:
+        NAME_CACHE[ticker] = ticker # Fallback if API fails
+        return ticker
 
 def generate_monthly_html(df_curve, initial_capital):
     if df_curve.empty: return "<p>No data</p>"
@@ -112,7 +140,6 @@ def generate_monthly_html(df_curve, initial_capital):
     """
     return html
 
-# --- NEW HELPER: Generate Current Holdings HTML ---
 def generate_holdings_html(state):
     positions = state.get('positions', {})
     if not positions:
@@ -120,6 +147,9 @@ def generate_holdings_html(state):
 
     rows = ""
     for tik, pos in positions.items():
+        # Get Name
+        name = get_stock_name(tik)
+
         # 1. Entry Date
         entry_date = pos.get('first_entry')
         date_str = entry_date.strftime('%Y-%m-%d') if entry_date else "-"
@@ -133,7 +163,6 @@ def generate_holdings_html(state):
         size_pct = (mkt_val / equity) * 100 if equity > 0 else 0
         
         # 4. Return %
-        # Return on Invested Capital for this specific position
         invested = abs(pos.get('qty', 0) * pos.get('avg_cost', 0))
         unrealized = pos.get('unrealized', 0)
         ret_pct = (unrealized / invested) * 100 if invested > 0 else 0.0
@@ -142,7 +171,8 @@ def generate_holdings_html(state):
 
         rows += f"""
         <tr>
-            <td style='padding: 8px;'>{tik}</td>
+            <td style='padding: 8px; font-weight: bold;'>{tik}</td>
+            <td style='padding: 8px; color: #555;'>{name}</td>
             <td style='padding: 8px; text-align: center;'>{date_str}</td>
             <td style='padding: 8px; text-align: center;'>{p_type}</td>
             <td style='padding: 8px; text-align: right;'>{size_pct:.1f}%</td>
@@ -150,10 +180,12 @@ def generate_holdings_html(state):
         </tr>
         """
 
+    # ADDED: "Stock Name" column
     return f"""
     <table border='1' cellpadding='0' cellspacing='0' style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 14px;'>
         <tr style='background-color: #f2f2f2;'>
             <th style='padding: 8px; text-align: left;'>Ticker</th>
+            <th style='padding: 8px; text-align: left;'>Stock Name</th>
             <th style='padding: 8px; text-align: center;'>Entry Date</th>
             <th style='padding: 8px; text-align: center;'>Type</th>
             <th style='padding: 8px; text-align: right;'>Size</th>
@@ -185,7 +217,7 @@ def run_weekly_report():
         state_now = calculate_portfolio_state(txs, user.initial_capital, now)
         state_prev = calculate_portfolio_state(txs, user.initial_capital, two_weeks_ago)
         
-        # --- NEW SECTION 1: Current Holdings ---
+        # --- SECTION 1: Current Holdings ---
         email_body += "<h4>Current Holdings</h4>"
         email_body += generate_holdings_html(state_now)
         
@@ -196,13 +228,17 @@ def run_weekly_report():
 
         # --- SECTION 3: Position Changes ---
         email_body += "<h4>Position Changes (Last 14 Days)</h4>"
+        # ADDED: Stock Name column in Changes table as well
         email_body += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%; font-size: 14px;'>"
-        email_body += "<tr style='background-color: #f2f2f2;'><th style='text-align: left;'>Ticker</th><th style='text-align: center;'>Type</th><th style='text-align: right;'>Change</th></tr>"
+        email_body += "<tr style='background-color: #f2f2f2;'><th style='text-align: left;'>Ticker</th><th style='text-align: left;'>Stock Name</th><th style='text-align: center;'>Type</th><th style='text-align: right;'>Change</th></tr>"
 
         all_tickers = set(list(state_now['positions'].keys()) + list(state_prev['positions'].keys()))
         
         has_changes = False
         for tik in sorted(list(all_tickers)):
+            # Get Name
+            name = get_stock_name(tik)
+
             # Get Prev Stats
             p_prev = state_prev['positions'].get(tik, {})
             val_prev = p_prev.get('mkt_val', 0)
@@ -225,14 +261,15 @@ def run_weekly_report():
                 
                 email_body += f"""
                 <tr>
-                    <td>{tik}</td>
+                    <td style='font-weight: bold;'>{tik}</td>
+                    <td style='color: #555;'>{name}</td>
                     <td style='text-align: center;'>{side}</td>
                     <td style='text-align: right;'>{arrow} {pct_prev:.1f}% &rarr; {pct_curr:.1f}%</td>
                 </tr>
                 """
         
         if not has_changes:
-             email_body += "<tr><td colspan='3'>No active positions.</td></tr>"
+             email_body += "<tr><td colspan='4'>No active positions.</td></tr>"
 
         email_body += "</table>"
         email_body += f"<p><strong>Current Equity:</strong> ${state_now['equity']:,.0f}</p>"
