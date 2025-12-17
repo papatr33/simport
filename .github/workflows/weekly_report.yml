@@ -2,8 +2,8 @@ name: Weekly Portfolio Report
 
 on:
   schedule:
-    # Runs at 09:00 UTC every Saturday
-    - cron: '0 9 * * 6'
+    # Runs at 01:00 UTC every Saturday
+    - cron: '0 1 * * 6'
   workflow_dispatch:
 
 jobs:
