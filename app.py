@@ -891,6 +891,20 @@ def analyst_page(user, session_obj, is_pm_view=False):
                     sim_longs = current_longs.copy()
                     sim_shorts = current_shorts.copy()
                     
+                    # -----------------------------------------------
+                    # 1. FULL UNWIND DETECTION (OVERRIDE)
+                    # -----------------------------------------------
+                    is_full_unwind = False
+                    current_qty = current_pos['qty'] if current_pos else 0
+                    
+                    if side == 'SELL' and current_pos and current_pos['type'] == 'LONG':
+                        if abs(current_qty - qty_input) < 0.001: is_full_unwind = True
+                    elif side == 'BUY_TO_COVER' and current_pos and current_pos['type'] == 'SHORT':
+                        if abs(abs(current_qty) - qty_input) < 0.001: is_full_unwind = True
+
+                    if is_full_unwind:
+                        warning_msg = "ℹ️ Full position unwind detected. Compliance checks (Frequency, Lockup) bypassed."
+
                     # Update specific position
                     if side == 'BUY':
                         if final_tik in sim_longs:
@@ -900,7 +914,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
                             sim_longs[final_tik] = {'mkt_val': est_amount}
                             
                     elif side == 'SELL':
-                        if final_tik in sim_longs:
+                        if is_full_unwind:
+                            if final_tik in sim_longs: del sim_longs[final_tik]
+                        elif final_tik in sim_longs:
                             old_val = sim_longs[final_tik]['mkt_val']
                             new_val = old_val - est_amount
                             if new_val < 100: # Assuming closed
@@ -916,7 +932,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
                             sim_shorts[final_tik] = {'mkt_val': est_amount}
                     
                     elif side == 'BUY_TO_COVER':
-                        if final_tik in sim_shorts:
+                        if is_full_unwind:
+                            if final_tik in sim_shorts: del sim_shorts[final_tik]
+                        elif final_tik in sim_shorts:
                             old_val = sim_shorts[final_tik]['mkt_val']
                             new_val = old_val - est_amount
                             if new_val < 100:
@@ -974,7 +992,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
                              warning_msg = f"{warning_msg} {w}" if warning_msg else f"⚠️ Warning: {w}"
 
                     # 3. FREQUENCY LIMIT (Modified: Block repeated unwinds only)
-                    if side in ['SELL', 'BUY_TO_COVER']:
+                    # Bypass if is_full_unwind
+                    if side in ['SELL', 'BUY_TO_COVER'] and not is_full_unwind:
                         check_start_date = eval_date - timedelta(days=5)
                         recent_unwinds = session_obj.query(Transaction).filter(
                             Transaction.user_id == user.id,
@@ -988,7 +1007,8 @@ def analyst_page(user, session_obj, is_pm_view=False):
                             error_msg = f"Compliance Violation: Unwind Frequency. You have already executed a {side} on {final_tik} in the last 5 days. Repeated unwinding is not permitted."
 
                     # 4. LOCKUP (Existing logic remains valid for closing trades)
-                    if side in ['SELL', 'BUY_TO_COVER']:
+                    # Bypass if is_full_unwind
+                    if side in ['SELL', 'BUY_TO_COVER'] and not is_full_unwind:
                         curr_date = datetime.combine(d_val, datetime.min.time()) if test_mode else datetime.now()
                         if not current_pos:
                              error_msg = "Cannot close a position you don't hold."
@@ -1265,4 +1285,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
