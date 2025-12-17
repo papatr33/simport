@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from datetime import datetime, timedelta
 import pandas as pd
 import toml
-import yfinance as yf # Added for name fetching
+import yfinance as yf
 
 # Import shared logic
 from core_logic import calculate_portfolio_state, get_ytd_performance
@@ -59,31 +59,20 @@ def fetch_user_transactions(session, user_id):
         'local_price': t.local_price, 'price': t.price
     } for t in txs]
 
-# --- NEW: Name Fetching Helper ---
+# --- NAME CACHE ---
 NAME_CACHE = {}
 
 def get_stock_name(ticker):
-    """Fetches stock name from yfinance with caching."""
-    if ticker in NAME_CACHE:
-        return NAME_CACHE[ticker]
-    
+    if ticker in NAME_CACHE: return NAME_CACHE[ticker]
     try:
-        # Ticker object
         t = yf.Ticker(ticker)
-        # Try long name, then short name, then fallback to ticker
-        # We use a fast timeout or just rely on standard fetch. 
-        # Note: .info can be slow, but for a weekly report it's acceptable.
         info = t.info
         name = info.get('longName') or info.get('shortName') or ticker
-        
-        # Shorten very long names for email readability
-        if len(name) > 30:
-            name = name[:27] + "..."
-            
+        if len(name) > 30: name = name[:27] + "..."
         NAME_CACHE[ticker] = name
         return name
     except Exception:
-        NAME_CACHE[ticker] = ticker # Fallback if API fails
+        NAME_CACHE[ticker] = ticker
         return ticker
 
 def generate_monthly_html(df_curve, initial_capital):
@@ -147,26 +136,16 @@ def generate_holdings_html(state):
 
     rows = ""
     for tik, pos in positions.items():
-        # Get Name
         name = get_stock_name(tik)
-
-        # 1. Entry Date
         entry_date = pos.get('first_entry')
         date_str = entry_date.strftime('%Y-%m-%d') if entry_date else "-"
-        
-        # 2. Type
         p_type = pos.get('type', 'FLAT')
-        
-        # 3. Size (as % of Equity)
         equity = state.get('equity', 1)
         mkt_val = pos.get('mkt_val', 0)
         size_pct = (mkt_val / equity) * 100 if equity > 0 else 0
-        
-        # 4. Return %
         invested = abs(pos.get('qty', 0) * pos.get('avg_cost', 0))
         unrealized = pos.get('unrealized', 0)
         ret_pct = (unrealized / invested) * 100 if invested > 0 else 0.0
-        
         color = '#10B981' if ret_pct >= 0 else '#EF4444'
 
         rows += f"""
@@ -180,7 +159,6 @@ def generate_holdings_html(state):
         </tr>
         """
 
-    # ADDED: "Stock Name" column
     return f"""
     <table border='1' cellpadding='0' cellspacing='0' style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 14px;'>
         <tr style='background-color: #f2f2f2;'>
@@ -228,7 +206,6 @@ def run_weekly_report():
 
         # --- SECTION 3: Position Changes ---
         email_body += "<h4>Position Changes (Last 14 Days)</h4>"
-        # ADDED: Stock Name column in Changes table as well
         email_body += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%; font-size: 14px;'>"
         email_body += "<tr style='background-color: #f2f2f2;'><th style='text-align: left;'>Ticker</th><th style='text-align: left;'>Stock Name</th><th style='text-align: center;'>Type</th><th style='text-align: right;'>Change</th></tr>"
 
@@ -236,16 +213,13 @@ def run_weekly_report():
         
         has_changes = False
         for tik in sorted(list(all_tickers)):
-            # Get Name
             name = get_stock_name(tik)
-
-            # Get Prev Stats
+            
             p_prev = state_prev['positions'].get(tik, {})
             val_prev = p_prev.get('mkt_val', 0)
             equity_prev = state_prev['equity'] if state_prev['equity'] > 0 else 1
             pct_prev = (val_prev / equity_prev) * 100
             
-            # Get Curr Stats
             p_curr = state_now['positions'].get(tik, {})
             val_curr = p_curr.get('mkt_val', 0)
             equity_curr = state_now['equity'] if state_now['equity'] > 0 else 1
@@ -278,24 +252,32 @@ def run_weekly_report():
 
     sender_email = os.environ.get("EMAIL_SENDER")
     sender_pass = os.environ.get("EMAIL_PASSWORD")
-    receiver_email = os.environ.get("EMAIL_RECEIVER")
-
-    if sender_email and sender_pass and receiver_email:
+    
+    # --- MODIFIED: Handle Multiple Receivers (Comma Separated) ---
+    receiver_env = os.environ.get("EMAIL_RECEIVER")
+    
+    if sender_email and sender_pass and receiver_env:
+        # Split by comma and strip whitespace to clean up the list
+        receiver_list = [r.strip() for r in receiver_env.split(',') if r.strip()]
+        # Join back into a clean comma-separated string for the email header
+        receiver_str = ", ".join(receiver_list)
+        
         msg = MIMEMultipart()
         msg['From'] = sender_email
-        msg['To'] = receiver_email
+        msg['To'] = receiver_str
         msg['Subject'] = f"AlphaTracker Weekly Report - {now.strftime('%Y-%m-%d')}"
         msg.attach(MIMEText(email_body, 'html'))
 
         try:
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
                 server.login(sender_email, sender_pass)
+                # send_message automatically extracts the list of recipients from msg['To']
                 server.send_message(msg)
-            print("Email sent successfully.")
+            print(f"Email sent successfully to: {receiver_str}")
         except Exception as e:
             print(f"Failed to send email: {e}")
     else:
-        print("Skipping Email: Credentials not found in environment variables.")
+        print("Skipping Email: Credentials or Receiver not found in environment variables.")
 
 if __name__ == "__main__":
     run_weekly_report()
