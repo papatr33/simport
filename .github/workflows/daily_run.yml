@@ -2,12 +2,7 @@ name: High Frequency Trade Execution
 
 on:
   schedule:
-    # Run every 10 minutes, but ONLY on Monday through Friday
-    # Cron syntax: minute hour day month day-of-week (1-5 is Mon-Fri)
-    # This prevents running up billable minutes on weekends when markets are closed.
     - cron: '*/10 * * * 1-5'
-  
-  # Keep this so you can click "Run workflow" manually for testing at any time
   workflow_dispatch:
 
 jobs:
@@ -20,6 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v2
         with:
+          # CHANGE THIS FROM '3.9' TO '3.10'
           python-version: '3.10'
           
       - name: Install dependencies
@@ -28,6 +24,5 @@ jobs:
           
       - name: Run Execution Script
         env:
-          # Make sure these secrets are set in your Repo Settings -> Secrets
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python daily_job.py
