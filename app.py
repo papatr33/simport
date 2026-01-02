@@ -1014,7 +1014,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                              error_msg = "Cannot close a position you don't hold."
                         else:
                             days_held = (curr_date - current_pos['first_entry']).days
-                            lockup_days = 2
+                            lockup_days = 30
                             is_violation = days_held < lockup_days
                             
                             if is_violation and side == 'BUY_TO_COVER':
@@ -1285,3 +1285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
