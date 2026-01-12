@@ -1014,7 +1014,7 @@ def analyst_page(user, session_obj, is_pm_view=False):
                              error_msg = "Cannot close a position you don't hold."
                         else:
                             days_held = (curr_date - current_pos['first_entry']).days
-                            lockup_days = 30
+                            lockup_days = 2
                             is_violation = days_held < lockup_days
                             
                             if is_violation and side == 'BUY_TO_COVER':
@@ -1136,29 +1136,55 @@ def pm_page(user, session_obj):
     )
     
     st.markdown("---")
-    st.subheader("Analyst Monthly Total Returns")
-    if analyst_monthly_summary:
-        # Create DataFrame from dict where keys are indices (Analysts) and values are Series (Months)
-        monthly_comp_df = pd.DataFrame(analyst_monthly_summary).T # Analysts as rows, Months as cols
-        st.dataframe(
-            monthly_comp_df.style.format("{:+.2f}%").map(color_pnl),
-            use_container_width=True
-        )
-    else:
-        st.info("No monthly data.")
-
-    st.markdown("---")
-    st.subheader("Monthly Returns Breakdown (Detailed)")
+    st.subheader("Monthly Returns Breakdown (All Analysts)")
     
     if monthly_data_frames:
-        tabs = st.tabs(list(monthly_data_frames.keys()))
-        for i, (name, df) in enumerate(monthly_data_frames.items()):
-            with tabs[i]:
-                # Already transposed in helper
-                st.dataframe(
-                    df.style.format("{:+.2f}%").map(color_pnl),
-                    use_container_width=True
-                )
+        # Build combined DataFrame with multi-index: (Analyst, Return Type)
+        combined_rows = []
+        
+        for analyst_name, m_df in monthly_data_frames.items():
+            # m_df has rows: Long Ret %, Short Ret %, Total Ret %
+            # and columns: months like "2024-Jan", "2024-Feb", etc.
+            for return_type in ["Long Ret %", "Short Ret %", "Total Ret %"]:
+                if return_type in m_df.index:
+                    row_data = m_df.loc[return_type].to_dict()
+                    row_data["Analyst"] = analyst_name
+                    row_data["Return Type"] = return_type.replace(" Ret %", "")  # "Long", "Short", "Total"
+                    combined_rows.append(row_data)
+        
+        if combined_rows:
+            combined_df = pd.DataFrame(combined_rows)
+            
+            # Get month columns (all columns except Analyst and Return Type)
+            month_cols = [c for c in combined_df.columns if c not in ["Analyst", "Return Type"]]
+            
+            # Sort month columns chronologically
+            month_cols_sorted = sorted(month_cols, key=lambda x: pd.to_datetime(x, format='%Y-%b'))
+            
+            # Calculate YTD as sum of all monthly returns
+            combined_df["YTD"] = combined_df[month_cols].sum(axis=1)
+            
+            # Reorder columns: Analyst, Return Type, sorted months, YTD
+            final_cols = ["Analyst", "Return Type"] + month_cols_sorted + ["YTD"]
+            combined_df = combined_df[final_cols]
+            
+            # Sort by Analyst and Return Type order (Long, Short, Total)
+            return_type_order = {"Long": 0, "Short": 1, "Total": 2}
+            combined_df["_sort_order"] = combined_df["Return Type"].map(return_type_order)
+            combined_df = combined_df.sort_values(["Analyst", "_sort_order"]).drop(columns=["_sort_order"])
+            combined_df = combined_df.reset_index(drop=True)
+            
+            # Format numeric columns
+            numeric_cols = month_cols_sorted + ["YTD"]
+            format_dict = {col: "{:+.2f}%" for col in numeric_cols}
+            
+            st.dataframe(
+                combined_df.style.format(format_dict).map(color_pnl, subset=numeric_cols),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No monthly data available yet.")
     else:
         st.info("No monthly data available yet.")
 
@@ -1285,4 +1311,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
