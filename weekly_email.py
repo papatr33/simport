@@ -129,6 +129,120 @@ def generate_monthly_html(df_curve, initial_capital):
     """
     return html
 
+def generate_all_analysts_monthly_html(analysts_data):
+    """
+    Generate a combined monthly returns table for all analysts.
+    analysts_data: list of dicts with keys: 'username', 'df_curve', 'initial_capital'
+    """
+    if not analysts_data:
+        return "<p>No data available.</p>"
+    
+    # Collect all monthly stats for all analysts
+    all_rows = []
+    all_months = set()
+    
+    for analyst_info in analysts_data:
+        username = analyst_info['username']
+        df_curve = analyst_info['df_curve']
+        initial_capital = analyst_info['initial_capital']
+        
+        if df_curve.empty:
+            continue
+        
+        df_curve['Date'] = pd.to_datetime(df_curve['Date'])
+        df_curve['Month'] = df_curve['Date'].dt.to_period('M')
+        
+        monthly_stats = {}
+        prev_equity = initial_capital
+        
+        for month, group in df_curve.groupby('Month'):
+            month_end_equity = group['Equity'].iloc[-1]
+            if prev_equity == 0:
+                prev_equity = initial_capital
+            
+            long_pnl_sum = group['Long PnL'].sum()
+            short_pnl_sum = group['Short PnL'].sum()
+            
+            long_ret = (long_pnl_sum / prev_equity) * 100
+            short_ret = (short_pnl_sum / prev_equity) * 100
+            total_ret = ((month_end_equity - prev_equity) / prev_equity) * 100
+            
+            month_str = month.strftime('%Y-%b')
+            monthly_stats[month_str] = {"Long": long_ret, "Short": short_ret, "Total": total_ret}
+            all_months.add(month_str)
+            prev_equity = month_end_equity
+        
+        # Calculate YTD properly (sum of PnL / initial capital)
+        ytd_long = (df_curve['Long PnL'].sum() / initial_capital) * 100
+        ytd_short = (df_curve['Short PnL'].sum() / initial_capital) * 100
+        final_equity = df_curve['Equity'].iloc[-1]
+        ytd_total = ((final_equity - initial_capital) / initial_capital) * 100
+        
+        # Store rows for this analyst
+        for return_type in ["Long", "Short", "Total"]:
+            row = {
+                "Analyst": username,
+                "Return Type": return_type
+            }
+            for month_str in monthly_stats:
+                row[month_str] = monthly_stats[month_str][return_type]
+            
+            # Add YTD
+            if return_type == "Long":
+                row["YTD"] = ytd_long
+            elif return_type == "Short":
+                row["YTD"] = ytd_short
+            else:
+                row["YTD"] = ytd_total
+            
+            all_rows.append(row)
+    
+    if not all_rows:
+        return "<p>No data available.</p>"
+    
+    # Sort months chronologically
+    sorted_months = sorted(list(all_months), key=lambda x: pd.to_datetime(x, format='%Y-%b'))
+    
+    # Build HTML table
+    header_cols = ["Analyst", "Type"] + sorted_months + ["YTD"]
+    header_html = "".join([f"<th style='padding: 8px; text-align: center; background-color: #f8f9fa;'>{col}</th>" for col in header_cols])
+    
+    rows_html = ""
+    prev_analyst = None
+    
+    for row in all_rows:
+        analyst_display = row["Analyst"] if row["Analyst"] != prev_analyst else ""
+        prev_analyst = row["Analyst"]
+        
+        # Add visual separator between analysts
+        row_style = ""
+        if analyst_display:
+            row_style = "border-top: 2px solid #333;"
+        
+        cells = f"<td style='padding: 8px; font-weight: bold;'>{analyst_display}</td>"
+        cells += f"<td style='padding: 8px;'>{row['Return Type']}</td>"
+        
+        for month in sorted_months:
+            val = row.get(month, 0)
+            color = '#10B981' if val >= 0 else '#EF4444'
+            weight = 'bold' if row['Return Type'] == 'Total' else 'normal'
+            cells += f"<td style='padding: 8px; text-align: center; color: {color}; font-weight: {weight};'>{val:+.2f}%</td>"
+        
+        # YTD column
+        ytd_val = row.get("YTD", 0)
+        ytd_color = '#10B981' if ytd_val >= 0 else '#EF4444'
+        ytd_weight = 'bold' if row['Return Type'] == 'Total' else 'normal'
+        cells += f"<td style='padding: 8px; text-align: center; color: {ytd_color}; font-weight: {ytd_weight}; background-color: #f1f5f9;'>{ytd_val:+.2f}%</td>"
+        
+        rows_html += f"<tr style='{row_style}'>{cells}</tr>"
+    
+    return f"""
+    <table border='1' cellpadding='0' cellspacing='0' style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 13px;'>
+        <tr>{header_html}</tr>
+        {rows_html}
+    </table>
+    """
+
 def generate_holdings_html(state):
     positions = state.get('positions', {})
     if not positions:
@@ -185,6 +299,20 @@ def run_weekly_report():
     
     now = datetime.now()
     two_weeks_ago = now - timedelta(days=14)
+
+    # --- SECTION 0: Collect data for all analysts and generate combined table ---
+    analysts_data = []
+    for user in analysts:
+        txs = fetch_user_transactions(session, user.id)
+        df_curve, _ = get_ytd_performance(txs, user.initial_capital)
+        analysts_data.append({
+            'username': user.username,
+            'df_curve': df_curve,
+            'initial_capital': user.initial_capital
+        })
+    
+    email_body += "<h3>📊 Monthly Returns Breakdown (All Analysts)</h3>"
+    email_body += generate_all_analysts_monthly_html(analysts_data)
 
     for user in analysts:
         email_body += f"<hr style='border: 1px solid #eee; margin-top: 30px;'><h3>👤 {user.username} ({user.role})</h3>"
