@@ -1081,6 +1081,7 @@ def pm_page(user, session_obj):
     summary = []
     
     monthly_data_frames = {} 
+    analyst_curve_data = {}  # Store df_curve and initial_capital for YTD calculation
     
     progress = st.progress(0, text="Calculating Portfolio Analytics...")
     
@@ -1113,6 +1114,7 @@ def pm_page(user, session_obj):
         m_df = render_monthly_breakdown(df_c, a.initial_capital)
         if not m_df.empty:
             monthly_data_frames[a.username] = m_df
+            analyst_curve_data[a.username] = {'df_curve': df_c, 'initial_capital': a.initial_capital}
             # Extract Total Ret row for the horizontal summary
             if "Total Ret %" in m_df.index:
                 analyst_monthly_summary[a.username] = m_df.loc["Total Ret %"]
@@ -1145,24 +1147,48 @@ def pm_page(user, session_obj):
         for analyst_name, m_df in monthly_data_frames.items():
             # m_df has rows: Long Ret %, Short Ret %, Total Ret %
             # and columns: months like "2024-Jan", "2024-Feb", etc.
+            
+            # Calculate proper YTD from df_curve (sum of PnL / initial_capital)
+            ytd_long = 0.0
+            ytd_short = 0.0
+            ytd_total = 0.0
+            
+            if analyst_name in analyst_curve_data:
+                curve_info = analyst_curve_data[analyst_name]
+                df_curve = curve_info['df_curve']
+                init_cap = curve_info['initial_capital']
+                
+                if not df_curve.empty and 'Long PnL' in df_curve.columns:
+                    ytd_long = (df_curve['Long PnL'].sum() / init_cap) * 100
+                    ytd_short = (df_curve['Short PnL'].sum() / init_cap) * 100
+                    # Total YTD from equity change
+                    final_equity = df_curve['Equity'].iloc[-1]
+                    ytd_total = ((final_equity - init_cap) / init_cap) * 100
+            
             for return_type in ["Long Ret %", "Short Ret %", "Total Ret %"]:
                 if return_type in m_df.index:
                     row_data = m_df.loc[return_type].to_dict()
                     row_data["Analyst"] = analyst_name
                     row_data["Return Type"] = return_type.replace(" Ret %", "")  # "Long", "Short", "Total"
+                    
+                    # Add proper YTD value
+                    if return_type == "Long Ret %":
+                        row_data["YTD"] = ytd_long
+                    elif return_type == "Short Ret %":
+                        row_data["YTD"] = ytd_short
+                    else:
+                        row_data["YTD"] = ytd_total
+                    
                     combined_rows.append(row_data)
         
         if combined_rows:
             combined_df = pd.DataFrame(combined_rows)
             
-            # Get month columns (all columns except Analyst and Return Type)
-            month_cols = [c for c in combined_df.columns if c not in ["Analyst", "Return Type"]]
+            # Get month columns (all columns except Analyst, Return Type, and YTD)
+            month_cols = [c for c in combined_df.columns if c not in ["Analyst", "Return Type", "YTD"]]
             
             # Sort month columns chronologically
             month_cols_sorted = sorted(month_cols, key=lambda x: pd.to_datetime(x, format='%Y-%b'))
-            
-            # Calculate YTD as sum of all monthly returns
-            combined_df["YTD"] = combined_df[month_cols].sum(axis=1)
             
             # Reorder columns: Analyst, Return Type, sorted months, YTD
             final_cols = ["Analyst", "Return Type"] + month_cols_sorted + ["YTD"]
@@ -1173,6 +1199,15 @@ def pm_page(user, session_obj):
             combined_df["_sort_order"] = combined_df["Return Type"].map(return_type_order)
             combined_df = combined_df.sort_values(["Analyst", "_sort_order"]).drop(columns=["_sort_order"])
             combined_df = combined_df.reset_index(drop=True)
+            
+            # Blank out repeated analyst names for cleaner grouping
+            prev_analyst = None
+            for idx in combined_df.index:
+                curr_analyst = combined_df.at[idx, "Analyst"]
+                if curr_analyst == prev_analyst:
+                    combined_df.at[idx, "Analyst"] = ""
+                else:
+                    prev_analyst = curr_analyst
             
             # Format numeric columns
             numeric_cols = month_cols_sorted + ["YTD"]
