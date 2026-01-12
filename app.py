@@ -666,12 +666,12 @@ def analyst_page(user, session_obj, is_pm_view=False):
 
             holdings_data.append({
                 "Ticker": tik, "Type": pos['type'], "Market": pos['market'],
+                "Port %": port_pct,
                 "Qty": f"{pos['qty']:,.0f}", 
                 "Avg Cost (USD)": f"${pos['avg_cost']:,.2f}", 
                 "Avg Cost (Local)": cost_str,
                 "Current Price": price_str,
                 "Market Val (USD)": pos.get('mkt_val', 0),
-                "Port %": port_pct,
                 "Unrealized PnL": unrealized_pnl,
                 "Realized PnL": realized_pnl, 
                 "Return %": ret_pct,
