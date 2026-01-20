@@ -122,6 +122,18 @@ def calculate_portfolio_state_cached(txs_data, initial_capital):
 def get_ytd_performance_cached(txs_data, initial_capital):
     return get_ytd_performance(txs_data, initial_capital)
 
+@st.cache_data(ttl=86400, show_spinner=False)  # Cache for 24 hours
+def get_stock_name(ticker):
+    """Fetch stock name from Yahoo Finance with caching."""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        name = info.get('longName') or info.get('shortName') or ticker
+        if len(name) > 35:
+            name = name[:32] + "..."
+        return name
+    except Exception:
+        return ticker
 
 
 def get_historical_price(ticker, date_obj, market):
@@ -665,7 +677,9 @@ def analyst_page(user, session_obj, is_pm_view=False):
             port_pct = (pos.get('mkt_val', 0) / state['equity']) * 100
 
             holdings_data.append({
-                "Ticker": tik, "Type": pos['type'], "Market": pos['market'],
+                "Ticker": tik, 
+                "Name": get_stock_name(tik),
+                "Type": pos['type'], "Market": pos['market'],
                 "Port %": port_pct,
                 "Qty": f"{pos['qty']:,.0f}", 
                 "Avg Cost (USD)": f"${pos['avg_cost']:,.2f}", 
