@@ -122,67 +122,18 @@ def calculate_portfolio_state_cached(txs_data, initial_capital):
 def get_ytd_performance_cached(txs_data, initial_capital):
     return get_ytd_performance(txs_data, initial_capital)
 
-def _is_english(text):
-    """Check if text is primarily ASCII/Latin (i.e. English)."""
-    if not text:
-        return False
-    ascii_count = sum(1 for c in text if ord(c) < 128)
-    return ascii_count / len(text) > 0.7
-
-@st.cache_data(ttl=86400, show_spinner=False)  # Cache for 24 hours
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_name(ticker):
-    """Fetch English stock name from Yahoo Finance with caching."""
+    """Fetch English stock name via yf.Search (fast, reliable)."""
     try:
-        t = yf.Ticker(ticker)
-        
-        long_name = None
-        short_name = None
-        
-        # Approach 1: Try info dict
-        try:
-            info = t.info
-            if info:
-                long_name = info.get('longName')
-                short_name = info.get('shortName')
-        except:
-            pass
-        
-        # Approach 2: Try after fetching history
-        if not long_name and not short_name:
-            try:
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    info = t.info
-                    long_name = info.get('longName')
-                    short_name = info.get('shortName')
-            except:
-                pass
-        
-        # Approach 3: Try basic_info attribute
-        if not long_name and not short_name:
-            try:
-                if hasattr(t, 'basic_info') and t.basic_info:
-                    long_name = t.basic_info.get('longName')
-                    short_name = t.basic_info.get('shortName')
-            except:
-                pass
-        
-        # Prefer English name: pick longName if English, else shortName if English, else whichever exists
-        name = None
-        if long_name and _is_english(long_name):
-            name = long_name
-        elif short_name and _is_english(short_name):
-            name = short_name
-        elif long_name:
-            name = long_name
-        elif short_name:
-            name = short_name
-        
-        if name:
-            if len(name) > 35:
-                name = name[:32] + "..."
-            return name
-        
+        results = yf.Search(ticker, max_results=1)
+        if results.quotes:
+            q = results.quotes[0]
+            name = q.get('longname') or q.get('shortname')
+            if name:
+                if len(name) > 35:
+                    name = name[:32] + "..."
+                return name
         return ticker
     except Exception:
         return ticker
