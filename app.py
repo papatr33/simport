@@ -1310,8 +1310,10 @@ def admin_page(session_obj):
 def main():
     session = Session()
     try:
-        if not session.query(User).filter_by(username='admin').first():
-            session.add(User(username='admin', password_hash=bcrypt.hashpw('8848'.encode(), bcrypt.gensalt()).decode(), role='admin'))
+        admin_user = st.secrets["admin"]["username"]
+        admin_pass = st.secrets["admin"]["password"]
+        if not session.query(User).filter_by(username=admin_user).first():
+            session.add(User(username=admin_user, password_hash=bcrypt.hashpw(admin_pass.encode(), bcrypt.gensalt()).decode(), role='admin'))
             session.commit()
     except: pass
 
