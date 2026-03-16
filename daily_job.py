@@ -28,7 +28,9 @@ MARKET_CONFIG = {
     "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY", "delay_min": 20},
     "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP", "delay_min": 20},
     "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR", "delay_min": 15},
-    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR", "delay_min": 15}
+    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR", "delay_min": 15},
+    "Korea (KOSPI)": {"suffix": ".KS", "fx": "KRW=X", "currency": "KRW", "delay_min": 20},
+    "Korea (KOSDAQ)": {"suffix": ".KQ", "fx": "KRW=X", "currency": "KRW", "delay_min": 20}
 }
 
 # CRITICAL: Map Markets to their Local Timezones to interpret YFinance data correctly
@@ -40,7 +42,9 @@ MARKET_TIMEZONES = {
     "Japan": "Asia/Tokyo",
     "UK": "Europe/London",
     "France": "Europe/Paris",
-    "Netherlands": "Europe/Amsterdam"
+    "Netherlands": "Europe/Amsterdam",
+    "Korea (KOSPI)": "Asia/Seoul",
+    "Korea (KOSDAQ)": "Asia/Seoul"
 }
 
 # --- 2. DB SETUP ---

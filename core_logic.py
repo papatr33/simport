@@ -12,7 +12,9 @@ MARKET_CONFIG = {
     "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
     "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"}, 
     "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"},
-    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR"}
+    "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR"},
+    "Korea (KOSPI)": {"suffix": ".KS", "fx": "KRW=X", "currency": "KRW"},
+    "Korea (KOSDAQ)": {"suffix": ".KQ", "fx": "KRW=X", "currency": "KRW"}
 }
 
 def extract_scalar(val):
