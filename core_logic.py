@@ -11,6 +11,7 @@ MARKET_CONFIG = {
     "China (Shenzhen)": {"suffix": ".SZ", "fx": "CNY=X", "currency": "CNY"},
     "Japan": {"suffix": ".T", "fx": "JPY=X", "currency": "JPY"},
     "UK": {"suffix": ".L", "fx": "GBP=X", "currency": "GBP"}, 
+    "Germany": {"suffix": ".DE", "fx": "EUR=X", "currency": "EUR"},
     "France": {"suffix": ".PA", "fx": "EUR=X", "currency": "EUR"},
     "Netherlands": {"suffix": ".AS", "fx": "EUR=X", "currency": "EUR"},
     "Korea (KOSPI)": {"suffix": ".KS", "fx": "KRW=X", "currency": "KRW"},
